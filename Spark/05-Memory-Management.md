@@ -13,6 +13,9 @@
 12. Failure Modes & Diagnostic Playbook
 13. Tuning Checklist / Best Practices
 14. Interview Quick-Reference (rapid fire)
+15. Serialization & Memory: Kryo vs Java
+16. Structured Streaming State Store Memory
+17. Executor Memory Sanity Checks & Practical Gotchas
 
 ## 1. Why Memory Management Is Central to Spark
 
@@ -208,6 +211,7 @@ Shuffle is one of the two biggest memory consumers (alongside caching), and it i
 | `MEMORY_AND_DISK_SER` | Serialized in memory, spills to disk | Yes | Compact and avoids recomputation — a good middle ground for data that doesn't fully fit in memory. |
 | `DISK_ONLY` | Serialized on disk only | Always | For when memory is too constrained to hold any of it but recomputation would be too expensive to redo. |
 | `*_2` suffix | Any of the above, replicated to 2 executors | — | Adds resilience for the cached data itself (survives losing one executor), at double the storage cost. |
+| `OFF_HEAP` | Serialized, in the off-heap pool | Depends on off-heap sizing | Requires `spark.memory.offHeap.enabled=true` (§4). Keeps cached data out of the GC-managed heap entirely — see §17 for detail. Missing from most summaries but a real, usable level. |
 
 **When to cache:** the same DataFrame/RDD feeds **multiple actions or branches**, and/or the upstream computation producing it is expensive relative to how often it's reused. Caching reflexively ("just in case") wastes Storage memory and increases the odds of the Execution-eviction dynamic from §3 kicking in mid-job.
 
@@ -274,3 +278,34 @@ Shuffle is one of the two biggest memory consumers (alongside caching), and it i
 - **`spark.driver.maxResultSize`** is a distinct, deliberate cap — different failure signature from a driver heap OOM.
 - **Order of preference for Python logic:** built-in SQL functions > Pandas UDFs (Arrow) > row-at-a-time Python UDFs (pickle).
 - **Caching best practice:** cache only what's reused across multiple actions/branches; always `unpersist()` when done.
+
+## 15. Serialization & Memory: Kryo vs Java
+
+This was missing from the original file, but it's a direct, frequently-tested lever on memory footprint — not just a performance detail.
+
+- Spark's **default serializer is Java serialization** — simple and works with any `Serializable` class, but verbose: it writes full class metadata with every object, producing larger serialized objects and slower (de)serialization.
+- **Kryo** (`spark.serializer=org.apache.spark.serializer.KryoSerializer`) produces **significantly more compact** serialized representations and serializes/deserializes faster. This matters for memory management specifically because:
+  - **Cached data** stored with a `_SER` storage level (`MEMORY_ONLY_SER`, `MEMORY_AND_DISK_SER`) takes less Storage memory under Kryo than under Java serialization for the same data.
+  - **Shuffle data** (Execution memory during shuffle write/read, and the actual bytes transferred over the network) shrinks too — smaller shuffle footprint means less spill pressure and less network I/O.
+  - **Broadcast variables** are also serialized to be shipped to executors — a large broadcast table serializes smaller (and ships faster) under Kryo.
+- **Trade-off:** Kryo doesn't serialize arbitrary classes as seamlessly out of the box — for best results (and to avoid falling back to a slower reflection-based path) you register your custom classes with `spark.kryo.registrationRequired=true` and `conf.registerKryoClasses(Array(classOf[MyClass]))`. Without registration it still works, just less optimally.
+- **Practical guidance:** for any job doing heavy shuffling, wide joins, or `_SER`/disk caching of large custom objects, switching to Kryo is one of the cheapest wins available — it directly reduces memory pressure in both Storage and Execution without touching partitioning or hardware.
+
+## 16. Structured Streaming State Store Memory (Advanced)
+
+This is a distinct memory consumer that the original file didn't cover at all, and it's a common source of OOM specifically in **stateful streaming jobs** (windowed aggregations, `mapGroupsWithState`, stream-stream joins, deduplication).
+
+- Stateful operations in Structured Streaming must keep **running state between micro-batches** (e.g., partial aggregates for an open window, or rows buffered for a stream-stream join waiting on a match). This state lives in a **State Store**, one per stateful partition.
+- **Default state store**: an in-memory `HashMap`-backed store, checkpointed to HDFS/durable storage between batches. This means the *live* working state for every open group/window sits in **executor JVM heap** (Execution/Storage-adjacent, but tracked separately from the Unified Memory Manager pools above) — it competes for the same heap as everything else on that executor.
+- **The failure mode:** if windows are large, watermarking is too loose (or absent), or cardinality of grouping keys is very high, state can grow **unbounded** across batches, since Spark can't evict state it doesn't yet know is safe to drop (no watermark) — this is a classic, slow-building OOM that looks fine for hours before it fails, distinct from the shuffle/cache-driven OOMs covered above.
+- **RocksDB state store** (`spark.sql.streaming.stateStore.providerClass = RocksDBStateStoreProvider`) is the mitigation: it keeps state **off-heap and spillable to local disk**, dramatically raising how much state a job can hold before hitting JVM heap limits — at some cost in per-access latency versus the pure in-memory default.
+- **Tuning levers specific to this:** set a **watermark** (`withWatermark`) so old state can actually be dropped; bound window sizes appropriately; consider RocksDB for any job with large or unbounded key cardinality; monitor the Spark UI's Structured Streaming tab for **state row count and memory used per operator**, which is where this problem shows up before it becomes a failure.
+
+## 17. Executor Memory Sanity Checks & Practical Gotchas
+
+A few small, concrete facts that didn't fit elsewhere but are worth knowing:
+
+- Spark enforces a **minimum executor memory** relative to the ~300MB reserved memory — if `spark.executor.memory` is set too low (historically needs to be at least a small multiple of the reserved amount), Spark fails fast at startup with an explicit "please increase executor memory" error rather than a confusing runtime OOM. Worth knowing this exists as a guardrail, distinct from every in-flight OOM scenario discussed above.
+- **`spark.rdd.compress`** (default `false` for `MEMORY_ONLY`-style levels, compression behavior varies by level/version) can shrink the memory footprint of cached RDD partitions further, at some CPU cost — a secondary lever alongside choosing a `_SER` storage level.
+- **Off-heap has its own dedicated persistence level**, `StorageLevel.OFF_HEAP` — caching with this level requires `spark.memory.offHeap.enabled=true` and stores the cached data in the off-heap pool (§4) rather than on-heap Storage memory. This was missing from the Storage Levels table in §10 — it's a real, usable option, not just a theoretical one, for jobs that already run with off-heap enabled and want cached data to avoid GC/heap pressure too.
+- Memory-related config changes (`executor.memory`, `memory.offHeap.*`, `executor.memoryOverhead`) require an **application restart** to take effect — they cannot be changed on a running `SparkContext`/`SparkSession`, unlike some SQL-level configs (e.g., `shuffle.partitions`) which can be set per-query at runtime.
