@@ -1,7 +1,12 @@
+# Spark Partitioning & Shuffling — Complete Guide
+
+---
+
 ## 1. Why This Topic Sits at the Center of Spark Performance
 
 Partitioning determines how data is split across a cluster; shuffling is what happens when that split has to change mid-job. Nearly every expensive thing that can happen in a Spark application — network-bound stages, disk spill, data skew, OOMs, small-file problems on write — traces back to how data was partitioned and when it had to be reshuffled. Unlike most tuning levers, which optimize one stage, getting partitioning right changes the shape of the *entire* job, because partition count and distribution propagate forward through every subsequent transformation until the next shuffle resets them.
 
+---
 
 ## 2. What a Partition Actually Is
 
@@ -10,15 +15,19 @@ Partitioning determines how data is split across a cluster; shuffling is what ha
 - Every partition's data, when an RDD is created from an external source, is typically determined by that source's own splitting logic — e.g., HDFS/S3 file splits, Parquet row-group boundaries, or a JDBC query's partitioning column.
 - A partition is not inherently tied to a physical machine permanently — it's a logical division that Spark schedules tasks against; a given partition could be processed on different executors across retries or re-execution.
 
+---
 
 ## 3. How Initial Partition Count Is Determined
 
 **Reading files (the common case):**
 - For file-based sources (CSV, JSON, Parquet, ORC, text), Spark computes partitions based on total input size divided by `spark.sql.files.maxPartitionBytes` (default 128MB) — roughly, one partition per 128MB of input, subject to file-splittability (a single unsplittable compressed file, e.g., gzip, cannot be divided across partitions no matter how large it is — this is a common, easy-to-miss source of a single oversized partition).
 - `spark.sql.files.openCostInBytes` (default 4MB) factors in the overhead of opening each file, so many small files get grouped together into fewer, larger partitions when their combined size is still below the target — this is Spark's built-in mitigation for the small-file problem on read, though it doesn't eliminate the problem on write (see §9).
+- `spark.sql.files.maxPartitionBytes` sets a target *ceiling* on partition size; its counterpart, `spark.sql.files.minPartitionNum`, sets a **floor** on the number of partitions produced (defaulting to `spark.default.parallelism`) — relevant for the opposite failure mode from §3.1: a small-ish but splittable file that would otherwise produce too few partitions to use available parallelism well.
+- **Object storage (S3, ADLS, GCS) has its own wrinkle worth knowing**, distinct from HDFS: these systems have no native "block" concept the way HDFS does, so Spark's partitioning math is based purely on byte ranges within objects rather than aligning to physical storage blocks — splittability (§3.1) still applies identically, but **listing** a large number of files/objects before any partitioning decision can even be made is itself a real, sometimes underestimated cost on object storage, since it goes through a metadata API rather than a fast local filesystem listing. A directory with a very large number of files can make the driver-side listing step itself a noticeable part of total job startup time, independent of how well the eventual partitioning turns out.
 
 **Reading from JDBC:**
 - Without explicit partitioning options, a JDBC read pulls through a **single partition/connection** — a serious bottleneck for large tables. Specifying `partitionColumn`, `lowerBound`, `upperBound`, and `numPartitions` lets Spark issue parallel queries, each covering a range of the partition column, producing one partition per range.
+- An alternative to the bound-based approach is the `predicates` parameter — an explicit list of `WHERE`-clause fragments, one per desired partition, giving direct control over exactly how the data is divided (useful when the partition column isn't a clean numeric range, or when a more deliberate, non-uniform split is wanted).
 
 **Parallelized collections:**
 - `sc.parallelize(data, numSlices)` — partition count is explicit, defaulting to `spark.default.parallelism` if not specified (which itself defaults to total available cores across the cluster for most cluster managers).
@@ -26,6 +35,38 @@ Partitioning determines how data is split across a cluster; shuffling is what ha
 **After a shuffle:**
 - Partition count resets to whatever the shuffle operation specifies — for DataFrame/SQL operations, this is governed by `spark.sql.shuffle.partitions` (default 200), **regardless of the input data's actual size** — a flat default that is very often wrong for both small jobs (200 partitions for a 10MB dataset is wasteful overhead) and large jobs (200 partitions for a 500GB shuffle means every partition is ~2.5GB, likely to spill or OOM).
 
+### 3.1 File Splittability and Compression — Why a "Big" File Can Still Be One Partition
+
+The one-line warning above (`§3`, "a single unsplittable compressed file cannot be divided") is worth unpacking fully, because it's a silent, easy-to-miss cause of a single task becoming a bottleneck for an entire job, with no error raised anywhere — the job just runs, slowly, with one task doing far more work than the rest.
+
+**What "splittable" actually means:** whether Spark (via Hadoop's `InputFormat` machinery underneath) can start reading a file from an arbitrary **byte offset** in the middle of it and still correctly identify where a logical record begins, without needing to have already decoded everything before that offset. If it can, the file can be divided into multiple partitions, each starting at a different offset, processed by different tasks in parallel. If it can't, the entire file must be handed to a **single task**, no matter how large it is or what `spark.sql.files.maxPartitionBytes` is set to — that config only influences splitting *within* files that are actually splittable; it has no power to split an unsplittable one.
+
+**Plain/row-oriented formats (CSV, JSON, text) — splittability depends entirely on compression:**
+
+| Compression | Splittable? | Why |
+|---|---|---|
+| None (plain `.csv`, `.json`, `.txt`) | Yes | Any byte offset can be scanned forward to the next line/record boundary. |
+| **gzip** | **No** | gzip's compressed stream has no internal synchronization points — decoding byte N requires having decoded everything before it, so the whole file must be read sequentially by one task. |
+| **Snappy** (raw, on plain text) | No (in practice) | Hadoop's standard Snappy codec, applied to a raw file, has the same sequential-dependency problem as gzip for generic splitting purposes. |
+| **bzip2** | **Yes** | bzip2 compresses in independent blocks with byte-aligned synchronization markers between them, so a reader can locate a block boundary and start decoding from there — Hadoop/Spark can exploit this to split a `.bz2` file into multiple partitions. |
+| **LZO** | Yes, but only with an index | LZO is block-based like bzip2, but Hadoop needs a separate `.lzo.index` file (built via a one-time indexing job) to know where block boundaries fall — without the index, it behaves as unsplittable. |
+| **Zstd** | No (in practice, for raw text) | Same category as gzip/Snappy for plain-file splitting purposes in standard Hadoop/Spark input handling, despite being a strong, fast codec in general. |
+
+**Columnar container formats (Parquet, ORC) — splittability is a property of the format itself, not the compression codec:**
+- Parquet and ORC are splittable **regardless of which internal compression codec is used** (gzip, Snappy, Zstd, LZ4 are all common choices here) — this is a frequent point of confusion, since gzip is unsplittable for plain text but perfectly fine inside a Parquet file.
+- The reason: these formats don't compress the file as one continuous stream the way a gzipped text file does. They compress **independently per column chunk, within row groups (Parquet) or stripes (ORC)** — and the file's footer metadata records exactly where each row group/stripe begins and ends. A reader can jump straight to a row group boundary (known from the footer, read first) and decompress just that self-contained chunk, with no dependency on anything before it.
+- This is a direct, practical reason converting large unsplittable sources (big gzipped CSV/JSON logs, for instance) into Parquet or ORC is such a common first optimization step for a pipeline — it doesn't just add columnar pruning and predicate pushdown, it also fixes the splittability problem at the same time, even if the Parquet file itself still uses gzip internally for its block compression.
+- **Avro** behaves similarly — it's a splittable binary container format with internal sync markers between blocks, independent of whichever codec compresses those blocks.
+
+**The practical failure pattern:** a single large gzipped CSV file (say, 20GB) read into Spark produces exactly **one partition**, handled by exactly **one task**, regardless of how many cores or executors are available — every other core sits idle while that one task works through 20GB alone. This often shows up as a job where the Spark UI shows a stage with only 1 task taking the overwhelming majority of the stage's total duration, which is a distinctive, specific symptom of this exact problem rather than generic skew (§13) — there's no "distribution" to fix here, since there's only one partition to begin with.
+
+**Mitigations:**
+1. **Convert to a splittable format at ingestion** — Parquet/ORC/Avro, which also brings the columnar/pushdown benefits discussed elsewhere in this guide.
+2. **Switch to a splittable compression codec** if staying in a row-oriented format — bzip2 for text, or LZO with its index file built — accepting bzip2's slower compression/decompression speed as the trade-off for parallelism.
+3. **Pre-split the file before it reaches Spark** — e.g., splitting one giant gzip file into many smaller gzip files upstream (each individually unsplittable, but now there are enough of them that Spark can at least assign one per task, restoring task-level parallelism even without true in-file splitting).
+4. **Decompress to plain text first** (trading storage space for splittability) if converting formats or re-compressing isn't feasible — makes the file trivially splittable again at the cost of disk space and losing compression's storage/IO benefits.
+
+---
 
 ## 4. Partitioning Schemes: Hash, Range, and Custom
 
@@ -48,6 +89,7 @@ Partitioning determines how data is split across a cluster; shuffling is what ha
 - At the RDD API level, a custom `Partitioner` subclass can implement arbitrary logic for `getPartition(key)` — useful for domain-specific distribution requirements a hash or range partitioner can't express (e.g., co-locating specific known key groups together, or implementing a partitioning scheme that matches an external system's own sharding for efficient joins against it).
 - The DataFrame/SQL API doesn't expose custom partitioners directly in the same way, though `repartition(n, col1, col2, ...)` gives hash-based control over which columns drive the partitioning without a fully custom implementation.
 
+---
 
 ## 5. Shuffle Mechanics: What Actually Happens on the Wire
 
@@ -64,6 +106,7 @@ The cost of a shuffle is therefore **disk I/O (write + spill) + network I/O (fet
 
 **A related internal detail worth knowing:** sort-based shuffle has a **bypass mode** (`spark.shuffle.sort.bypassMergeThreshold`, default 200) — when the number of output (reduce-side) partitions is at or below this threshold, Spark skips the sort step on the write side entirely and just writes one file per partition directly, since sorting isn't worth the overhead at low partition counts. This is also why `spark.sql.shuffle.partitions`' historic default happens to be exactly 200 — set at the boundary where the bypass optimization stops applying.
 
+---
 
 ## 6. Narrow vs Wide Transformations, Revisited Through a Shuffle Lens
 
@@ -71,6 +114,7 @@ The cost of a shuffle is therefore **disk I/O (write + spill) + network I/O (fet
 - **Wide:** output partitions can depend on data from many/all input partitions — requires a shuffle, creates a new stage boundary.
 - A job's **stage count** is directly determined by how many wide transformations it contains — each shuffle ends one stage and begins the next. Minimizing unnecessary wide transformations (or replacing them with narrow-equivalent alternatives, like `reduceByKey`'s map-side pre-combine instead of `groupByKey`'s full shuffle-then-group) is one of the highest-leverage structural optimizations available, because it removes an entire category of cost rather than tuning around it.
 
+---
 
 ## 7. Repartition vs Coalesce — Not Interchangeable
 
@@ -90,6 +134,7 @@ A common mistake: using `coalesce()` to *increase* parallelism (it simply won't,
 
 **Checking actual partition count directly** (rather than inferring it from configuration) is straightforward and worth knowing: `df.rdd.getNumPartitions()` — useful for confirming what a chain of operations actually produced, since defaults, AQE coalescing, and upstream shuffles can all make the real number diverge from what a config value alone would suggest.
 
+---
 
 ## 8. Adaptive Query Execution and Partitioning
 
@@ -100,6 +145,7 @@ AQE (`spark.sql.adaptive.enabled`, default `true` in modern Spark) directly addr
 
 AQE operates at **shuffle (query stage) boundaries only** — it re-plans the remainder of the query after a stage completes, using that stage's actual output statistics; it has no effect on the initial partitioning of a freshly-read source, which is still governed by the read-time logic in §3.
 
+---
 
 ## 9. Partitioning on Write, and the Small-File Problem
 
@@ -125,6 +171,7 @@ Skew is what happens when a chosen partitioning scheme (almost always hash-based
   4. **Pre-aggregate before the shuffle**, where the use case allows it, reducing the absolute row count the skewed key carries into the shuffle even if the relative skew ratio is unchanged.
 - Skew is a **data distribution problem**, not a partition-*count* problem — increasing `spark.sql.shuffle.partitions` does nothing for a hash-partitioned hot key, since every row for that key still lands in the same single partition regardless of how many partitions exist in total.
 
+---
 
 ## 11. Bucketing: Pre-Partitioning at Rest
 
@@ -135,6 +182,7 @@ Distinct from both in-memory partitioning and directory-based `partitionBy`, **b
 - Unlike `partitionBy`, bucketing doesn't create a directory-per-value structure (avoiding the high-cardinality small-file explosion risk from §9) — it creates a fixed number of files per bucket, regardless of key cardinality.
 - Two practical constraints worth knowing: bucketing is only fully supported via `saveAsTable` (a catalog-registered, typically Hive-compatible table) rather than a plain `.parquet(path)` write, since the bucketing metadata needs to be tracked somewhere; and the shuffle-free join optimization itself is gated by `spark.sql.sources.bucketing.enabled` (on by default), which must be true for Spark to actually recognize and exploit matching bucketing between two tables at join time.
 
+---
 
 ## 12. Dynamic Partition Pruning (DPP)
 
@@ -143,6 +191,7 @@ A runtime optimization specifically for joining a **partitioned** (via `partitio
 - If a dimension table is filtered (`WHERE region = 'EU'`) and then joined to a large fact table partitioned by that same column, DPP pushes the dimension-side filter into the fact table's **partition pruning at runtime**, reading only the fact table partitions that could possibly match rather than scanning the whole table.
 - Controlled by `spark.sql.optimizer.dynamicPartitionPruning.enabled` (on by default in modern Spark); entirely dependent on the fact table actually being partitioned on the relevant join/filter column at the storage layer — it has no effect otherwise.
 
+---
 
 ## 13. Diagnosing Partitioning/Shuffle Problems
 
@@ -156,7 +205,9 @@ A runtime optimization specifically for joining a **partitioned** (via `partitio
 | A read against a huge JDBC table is surprisingly slow and single-threaded | No partitioning options specified for the JDBC read | `partitionColumn`/`lowerBound`/`upperBound`/`numPartitions` on the read |
 | Repeated joins against the same large tables are consistently expensive | No bucketing; full shuffle cost paid every time | Whether bucketing the frequently-joined tables on the shared key would help |
 | A stage appears to re-run or "hang" after seemingly completing | `FetchFailedException` from a lost executor (spot/preemptible termination, OOM kill, aggressive scale-down) forcing shuffle output recomputation | Executor loss events in the Spark UI/logs; whether the external shuffle service is enabled; `spark.stage.maxConsecutiveAttempts` |
+| A read stage shows exactly 1 task taking far longer than everything else, on a large single file | The source file is unsplittable (e.g., gzip-compressed CSV/JSON) — the whole file is one partition by construction | File format/compression (§3.1); whether converting to Parquet/ORC or a splittable codec (bzip2, LZO+index) is feasible |
 
+---
 
 ## 14. Configuration Reference
 
@@ -165,6 +216,7 @@ A runtime optimization specifically for joining a **partitioned** (via `partitio
 | `spark.sql.shuffle.partitions` | 200 | Post-shuffle partition count for joins/aggregations (static; AQE can override dynamically). |
 | `spark.sql.files.maxPartitionBytes` | 128MB | Target size per partition when reading splittable files. |
 | `spark.sql.files.openCostInBytes` | 4MB | Estimated per-file open overhead, used to pack many small files into fewer partitions on read. |
+| `spark.sql.files.minPartitionNum` | `spark.default.parallelism` | Floor on partition count for file-based reads — the counterpart to `maxPartitionBytes`'s ceiling. |
 | `spark.default.parallelism` | total cores (cluster-manager dependent) | Default partition count for RDD operations without an explicit shuffle partition count. |
 | `spark.sql.adaptive.enabled` | true (modern Spark) | Enables AQE, including dynamic partition coalescing and skew splitting. |
 | `spark.sql.adaptive.coalescePartitions.enabled` | true (with AQE) | Enables automatic merging of small post-shuffle partitions. |
@@ -177,6 +229,7 @@ A runtime optimization specifically for joining a **partitioned** (via `partitio
 | `spark.stage.maxConsecutiveAttempts` | 4 | Retry limit for a stage before the job fails outright after repeated shuffle fetch failures. |
 | `spark.sql.sources.bucketing.enabled` | true | Gates whether Spark recognizes and exploits matching bucketing between two tables for shuffle-free joins. |
 
+---
 
 ## 15. Practical Tuning Checklist
 
@@ -191,7 +244,9 @@ A runtime optimization specifically for joining a **partitioned** (via `partitio
 - [ ] Confirm the external shuffle service is enabled when using dynamic allocation, so executor deallocation doesn't force shuffle recomputation.
 - [ ] If stages appear to silently re-run, check for `FetchFailedException`/executor loss before assuming it's a logic or data issue.
 - [ ] Use `df.rdd.getNumPartitions()` to confirm actual partition counts rather than inferring them purely from configuration.
+- [ ] For large source files, confirm the format/compression combination is actually splittable (§3.1) before assuming `maxPartitionBytes` will parallelize the read — a single large gzip file won't split no matter what that config says.
 
+---
 
 ## 16. A Concise Mental Model
 
