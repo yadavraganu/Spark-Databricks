@@ -21,7 +21,6 @@
 19. Common Misconceptions
 20. A Concise Mental Model
 
----
 
 ## 1. Batch vs. Streaming — and Where Structured Streaming Sits
 
@@ -46,7 +45,6 @@
 
 > **A note on history.** The legacy **DStream** API (`spark.streaming`) is a separate, older, RDD-based micro-batching library and is not recommended for new work. Several widely-quoted details (e.g., `spark.streaming.backpressure.enabled`, receiver-based sources, `StreamingContext.stop(gracefully)`) belong to DStreams, **not** to Structured Streaming. Be careful when reading older material.
 
----
 
 ## 2. The Programming Model and Execution Engine
 
@@ -138,7 +136,6 @@ Some DataFrame operations make no sense on unbounded data and are rejected with 
 
 A subtle one: registering a streaming DataFrame as a temp view and running SQL on it is fine, but Spark can **inject stateful operators while interpreting SQL**, so check `explain()` for state operators after writing SQL against a streaming view.
 
----
 
 ## 3. Sources and Sinks
 
@@ -222,7 +219,6 @@ An upsert keyed on a natural key is **idempotent**, so replaying a batch after a
 - Cache the batch DataFrame (`batch_df.persist()` / `unpersist()`) if you write it more than once, otherwise each write recomputes the micro-batch from the source.
 - `foreach` (row-level) takes an object with `open(partition_id, epoch_id)`, `process(row)`, and `close(error)` methods; `open` may return `False` to skip a partition/epoch already written, which is how you dedupe on replay.
 
----
 
 ## 4. Output Modes and Triggers
 
@@ -275,8 +271,6 @@ Consequences worth internalizing:
 ### 4.4 Empty batches and watermark progress
 
 With `spark.sql.streaming.noDataMicroBatches.enabled=true` (default), the engine runs an extra batch **even when no new data arrived** if the watermark advanced and some stateful operator needs to emit/clean state. This is why windows can finally close after the last events arrived. Disabling it saves resources but can leave results stuck until more data arrives.
-
----
 
 ## 5. Time Semantics, Latency/Throughput, and Windowing
 
@@ -340,8 +334,6 @@ events.groupBy(
 - **Session-window restrictions in streaming queries:** Update output mode is not supported, and the grouping key must contain **at least one column besides `session_window`** (a global session window works only in batch). Sessions are not partially aggregated locally by default because that needs an extra sort; if many rows share a key per partition, enabling `spark.sql.streaming.sessionWindow.merge.sessions.in.local.partition` can help.
 - The `window` column is a struct with `start` and `end`. To use a window result as the *event-time* input of a **second** windowed aggregation, use `window_time(window)` (3.4+), which returns the window's end minus a microsecond, so it is a valid event-time value.
 - A **late event is assigned to the window its event time belongs to**, not the window in which it arrived — as long as that window's state still exists (i.e., the watermark has not passed it). That is the entire point of event-time windows: the 10:00 reading arriving at 10:15 still lands in 10:00–10:05.
-
----
 
 ## 6. Watermarks in Depth
 
@@ -494,8 +486,6 @@ The number of state partitions equals `spark.sql.shuffle.partitions` **at the ti
 
 The query progress `stateOperators` section reports rows and memory per operator (§14). Spark 4.0 adds a **state data source** (state reader) that lets you query a checkpoint's state as a DataFrame for debugging — check your version's documentation for availability and syntax.
 
----
-
 ## 8. Stream Joins
 
 Structured Streaming supports **stream-static** and **stream-stream** joins. They are very different operations.
@@ -581,8 +571,6 @@ Stream-stream joins support **Append output mode only.**
 | One side is slowly-changing and large | Consider loading it as a stream-static join against a table format, or a stateful lookup in `flatMapGroupsWithState`/`transformWithState` |
 | Only need "has a match" | Left semi join (smaller output, same state cost) |
 
----
-
 ## 9. Checkpointing and the Micro-Batch Recovery Protocol
 
 ### 9.1 What the checkpoint contains
@@ -642,8 +630,6 @@ Because executors restore state from the checkpoint, **frequent executor churn**
 - On object stores, many small files and listing/commit latency become real costs; RocksDB changelog checkpointing and larger trigger intervals help.
 - Back up checkpoints before risky upgrades if you cannot afford a re-bootstrap.
 
----
-
 ## 10. Delivery Semantics (and How Spark Actually Delivers Them)
 
 ### 10.1 The three semantics in general
@@ -694,8 +680,6 @@ When any condition fails, you get **at-least-once**: no loss, possible duplicate
 - **Track applied batch ids**: store `(query_id, batch_id)` in the target or a side table inside the same transaction as the write; skip if present.
 - **Overwrite by partition per batch** (write batch N to a path/partition keyed by N, then atomically swap).
 
----
-
 ## 11. Restarts, Upgrades, and Query Evolution
 
 A restart with an existing checkpoint resumes exactly where the previous run left off — **provided the new query is compatible with what the checkpoint recorded.**
@@ -712,7 +696,8 @@ A restart with an existing checkpoint resumes exactly where the previous run lef
 - Changing **stateful operator definition**: grouping keys, aggregate functions, the set of dedup columns, join keys/conditions, state schema.
 - Changing **`spark.sql.shuffle.partitions`** for an existing stateful query (§7.5).
 - Changing the watermark *column*; changing the watermark *delay* is technically accepted but alters semantics going forward — be deliberate.
-- Some sink-type changes (compatibility is specific; e.g., moving between file and Kafka sinks has documented allowed/disallowed directions).
+- Changing the **output directory of a file sink** (not allowed); changing the **output topic of a Kafka sink** is allowed. Changing `foreach` sink code is allowed, but what it means for your output depends on the code.
+- For stateful operators specifically: any change to grouping keys or types, aggregate functions, dedup columns, stream-stream join type/equi-join columns/schema, or the schema and timeout type of arbitrary state is **not allowed** between restarts. Changing the *body* of a state-mapping function is allowed, but its effect on already-stored state is yours to reason about.
 
 **Strategies for evolving stateful queries**
 
@@ -721,8 +706,6 @@ A restart with an existing checkpoint resumes exactly where the previous run lef
 3. **Design for evolution:** keep stateful operators minimal; push business-logic changes into stateless stages or downstream batch; version state schemas deliberately (e.g., with `transformWithState`'s schema-evolution support in Spark 4.x).
 
 Operational note: **watch for restart storms** — a query that crashes on bad data and is auto-restarted immediately will loop; put poison-record handling (dead-letter, `from_json` with permissive mode and `_corrupt_record` handling) in the pipeline.
-
----
 
 ## 12. Architectural Patterns: Lambda, Kappa, and the Unified Approach
 
@@ -784,8 +767,6 @@ Structured Streaming's single API removes Lambda's biggest cost — the duplicat
 | Need both a rapid approximate answer *and* a periodically recomputed authoritative answer with materially different logic (e.g., heavy ML retraining) | Lambda-style, but unify code via shared libraries/DataFrame logic |
 | Historical + live from one platform, with ACID tables | Unified lakehouse (streaming + table formats) |
 
----
-
 ## 13. Performance Tuning and Capacity Planning
 
 ### 13.1 Define "keeping up"
@@ -813,6 +794,8 @@ A query **keeps up** when batch processing time stays under the trigger interval
 
 - Shorter trigger / default trigger; fewer shuffle partitions; avoid unnecessary shuffles; keep checkpoint storage fast (object-store commit latency is a per-batch tax); RocksDB changelog checkpointing; consider continuous mode only for simple stateless pipelines where ~ms matters.
 - Understand the **fixed per-batch overhead**: planning, offset-log and commit-log writes, task scheduling, state commit. For very small batches the overhead dominates.
+- **Asynchronous progress tracking** (`asyncProgressTrackingEnabled`, 3.4+) writes the offset and commit logs asynchronously, in parallel with processing, to cut per-batch latency. The trade-offs are real: checkpoint progress is **not guaranteed for every batch**, offset ranges can change on failure so **exactly-once is not guaranteed**, it is incompatible with `once`/`availableNow` triggers, and with a Kafka sink it supports only stateless pipelines. Use it only where at-least-once is acceptable.
+- For the opposite problem on quiet topics (many tiny batches), use Kafka's `minOffsetsPerTrigger` with `maxTriggerDelay` (§3.1) instead of shrinking work per batch.
 
 ### 13.5 Sink and storage hygiene
 
@@ -826,8 +809,7 @@ A query **keeps up** when batch processing time stays under the trigger interval
 - **Dynamic allocation fits streaming poorly** — executors idle between batches look removable, and removing executors forces state reload; if used, set conservative idle timeouts and minimums. Prefer a right-sized fixed allocation for stateful queries.
 - Use **stable (non-preemptible) capacity** for the driver and, ideally, stateful executors; restart policy and external supervision are mandatory for drivers.
 - Several queries in one application share executors and the scheduler; use **FAIR scheduler pools** to avoid one query starving another, or separate applications for isolation.
-
----
+- **Protect state locality.** State partitions prefer the executor that held them last batch; if tasks land elsewhere, state is reloaded from the checkpoint. For large state, raise `spark.locality.wait` and watch state-reload metrics (§7.3) rather than assuming placement is stable.
 
 ## 14. Monitoring and Debugging
 
@@ -866,7 +848,8 @@ spark.streams.active  # all active queries
 | `durationMs.addBatch` | Time actually executing the batch (the work); large ⇒ compute/shuffle/state/sink bound |
 | `durationMs.walCommit` / `latestOffset` | Offset-log and source metadata cost (spikes on slow object stores or Kafka metadata) |
 | `eventTime.watermark` | Current watermark — **if it stops moving, Append-mode windows and state cleanup stall** |
-| `stateOperators.numRowsTotal` | State size over time — monotonic growth = unbounded state |
+| `stateOperators.numRowsTotal` | State size over time — monotonic growth = unbounded state. **Reports 0 if RocksDB `trackTotalNumberOfRows` is disabled**, so a flat zero is not proof of small state |
+| `stateOperators.customMetrics` (HDFS provider: `loadedMapCacheHitCount` / `loadedMapCacheMissCount`) | Whether state is being reused in memory or reloaded from the checkpoint each batch |
 | `stateOperators.numRowsDroppedByWatermark` | Late data being dropped — compare to expectations; tune the delay |
 | `stateOperators.memoryUsedBytes` | State memory pressure |
 | `sources[].latestOffset − endOffset` | **Source lag** (how far behind real time) |
@@ -924,10 +907,15 @@ The **Structured Streaming** tab shows per-query input rate, process rate, batch
 | Kafka: `minPartitions` | unset | Minimum Spark partitions for Kafka reads |
 | Kafka: `startingOffsets` | `latest` (streaming) | First-start position only |
 | Kafka: `failOnDataLoss` | true | Fail when needed offsets were deleted |
-| File: `maxFilesPerTrigger` | 1000 | Per-batch file cap |
+| Kafka: `minOffsetsPerTrigger` / `maxTriggerDelay` | unset / 15m | Accumulate a minimum batch size before triggering, bounded by a maximum wait (3.2+) |
+| `spark.sql.streaming.stateStore.rocksdb.boundedMemoryUsage` | false | Cap total RocksDB memory on a node |
+| `spark.sql.streaming.stateStore.rocksdb.maxMemoryUsageMB` | 500 | Node-wide RocksDB memory cap when bounded |
+| `spark.sql.streaming.stateStore.rocksdb.trackTotalNumberOfRows` | true | Track total state rows (off = faster, but `numRowsTotal` reports 0) |
+| `asyncProgressTrackingEnabled` (query option) | false | Asynchronous offset/commit logging; lowers latency, drops exactly-once guarantees (3.4+) |
+| `spark.locality.wait` | 3s | How long the scheduler waits for the preferred executor; raise to keep state partitions in place |
+| File: `maxFilesPerTrigger` | no max | Per-batch file cap (set it explicitly if a backlog is possible) |
+| File: `maxFileAge` | 1 week | Files older than this (relative to the newest file) are ignored after the first batch |
 | `trigger(processingTime=…)` / `availableNow=True` / `continuous=…` | default trigger | Batch cadence / incremental batch / continuous mode |
-
----
 
 ## 17. Failure and Symptom Diagnosis Table
 
@@ -948,12 +936,14 @@ The **Structured Streaming** tab shows per-query input rate, process rate, batch
 | Join produces no output | Missing/too-tight time constraint; watermarks not defined; wrong key | Check join condition, constraint direction, watermark columns, event-time parsing |
 | Query rejected at start: unsupported operation | e.g., Complete mode with non-aggregation, `limit`, `distinct`, non-aggregated sort, invalid join/mode combination | Use supported equivalents (`dropDuplicates`, window + aggregation); review mode table |
 | Huge number of small output files | Short trigger + many partitions | Longer trigger, reduce partitions before write, compaction/OPTIMIZE |
+| Watermark declared but state still grows / Append output never appears | `withWatermark` on the wrong column, placed after the aggregation, or Complete mode | Check the five conditions in §6.6 |
+| `session_window` query rejected | Update mode, or no grouping column besides `session_window` | Use Append/Complete; add a key such as `user_id` (§5.3) |
+| Many tiny batches on a low-volume Kafka topic | Default trigger fires on any new data | `minOffsetsPerTrigger` + `maxTriggerDelay`, or a longer `processingTime` trigger |
+| Batches slow down after executor churn on a stateful query | State reloaded from checkpoint on new executors | State locality settings (§7.3), stable executors, RocksDB with changelog checkpointing |
 | Very slow commits / high `walCommit` | Object-store checkpoint latency, small-file metadata | Faster checkpoint storage, RocksDB changelog checkpointing, longer trigger |
 | First batch after start is enormous and fails | Starting from `earliest` or after downtime without rate limit | Set `maxOffsetsPerTrigger`/`maxFilesPerTrigger` |
 | Same file processed twice / files missed | Files not written atomically; mutated in place; path/glob changes | Write elsewhere then move atomically; don't modify files after landing |
 | Results differ on replay | Non-deterministic logic (`rand`, `uuid`, `current_timestamp`, external lookups) | Derive values from event data; seed deterministically; avoid side-effecting UDFs |
-
----
 
 ## 18. Production Readiness Checklist
 
@@ -986,8 +976,6 @@ The **Structured Streaming** tab shows per-query input rate, process rate, batch
 - [ ] Small-file strategy defined for the sink.
 - [ ] Capacity headroom for peak load (e.g., 2× steady state) and catch-up after outages.
 
----
-
 ## 19. Common Misconceptions
 
 | Misconception | Reality |
@@ -1004,8 +992,6 @@ The **Structured Streaming** tab shows per-query input rate, process rate, batch
 | "Backpressure is automatic." | That's DStreams. In Structured Streaming you rate-limit with `maxOffsetsPerTrigger`/`maxFilesPerTrigger`. |
 | "Kappa means no batch ever." | Kappa unifies *code and pipeline*; replay through the stream engine plays the role of batch reprocessing — and in Spark, `availableNow` makes incremental batch part of the same model. |
 | "Processing time is fine; it's simpler." | It's fine for rough alerting but results are **non-reproducible** and break replay-based correctness. |
-
----
 
 ## 20. A Concise Mental Model
 
