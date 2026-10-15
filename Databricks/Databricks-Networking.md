@@ -1,86 +1,138 @@
-## 1. The Two-Plane Architecture
+## 1. The Big Picture: Two Planes, Three Connection Points
 
-Every Databricks deployment splits into two planes that live in different AWS accounts:
+Databricks runs out of a **control plane** and a **compute plane**:
+
+- The **control plane** is the set of backend services Databricks manages (web application, REST APIs, job scheduler, cluster manager, Unity Catalog metadata).
+- The **compute plane** is where your data is processed. There are two kinds:
+  - **Classic compute plane** — compute runs in *your* AWS account, in your VPC, in the same region as the workspace.
+  - **Serverless compute plane** — compute runs in a Databricks-managed account, in the same cloud region as your workspace.
+
+Networking is easiest to reason about as **three connection points, each secured independently**:
 
 ```
-┌─────────────────────────────┐        ┌─────────────────────────────┐
-│   CONTROL PLANE               │        │   COMPUTE / DATA PLANE        │
-│   (Databricks' AWS account)   │◄──────►│   (YOUR AWS account)          │
-│                                │  HTTPS │                                │
-│  - Web application / UI       │  (443) │  - EC2 clusters (classic)     │
-│  - Jobs scheduler              │        │  - Serverless compute plane   │
-│  - Cluster manager             │        │  - Your VPC, S3 buckets       │
-│  - Unity Catalog metadata      │        │  - Your data                  │
-└─────────────────────────────┘        └─────────────────────────────┘
+ (1) Users & apps ───────────────► Control plane          "Inbound"
+ (2) Control plane ◄──────────────► Classic compute plane  "Classic"  (your VPC)
+ (3) Serverless compute plane ────► Your resources         "Outbound" (S3, DBs, APIs…)
 ```
 
-- The **control plane** is fully managed by Databricks — notebooks, job scheduling, the web app, cluster orchestration APIs, and (for Unity Catalog) metadata all live there.
-- The **compute/data plane** is where your actual workloads run and your data lives — classic compute runs in a VPC inside your AWS account; serverless compute runs in a Databricks-managed compute plane but still processes your data without it leaving your control.
-- Your data **never passes through** the control plane for query execution — only metadata, commands, and results do. This split is the foundation everything else in this guide builds on.
+| Connection | What you control | Main features |
+|---|---|---|
+| 1. Users → Databricks | Who can reach workspaces and the account console | Inbound PrivateLink, context-based ingress, IP access lists, firewall domain rules |
+| 2. Control plane ↔ classic compute | How your VPC connects to Databricks | Secure cluster connectivity, customer-managed VPC, back-end PrivateLink, VPC peering |
+| 3. Serverless compute → your resources | How Databricks-managed compute reaches your data | Network connectivity configurations (NCC), private endpoint rules, serverless egress control, firewall allowlisting |
 
----
+Connectivity between the control plane and the serverless compute plane is always over the cloud provider's backbone, never the public internet. Your data does not pass through the control plane for query execution — only metadata, commands and results do.
 
 ## 2. Secure Cluster Connectivity (SCC)
 
-**Secure Cluster Connectivity** is the default-on networking posture for the classic compute plane, and it's the single most important fact to know before designing anything else:
+SCC is on by default for all new workspaces:
 
-- Your VPC has **no open inbound ports** — nothing listens for connections from the control plane.
+- Your VPC has **no open inbound ports**.
 - Classic compute nodes have **no public IP addresses**.
-- Instead, cluster nodes **initiate an outbound** HTTPS (port 443) connection to the control plane through a **secure cluster connectivity relay**, which the control plane uses to send commands back down that already-open tunnel.
-- The relay deliberately separates two traffic types: web-app/REST-API traffic, and cluster-management traffic — so each can be secured and rate-limited independently.
+- Cluster nodes open an **outbound HTTPS (443) tunnel** to the control plane through the **SCC relay**. The control plane sends commands back down that tunnel.
+- The relay separates web-app/REST-API traffic from cluster-management traffic.
 
-Serverless compute doesn't use the SCC relay (it's a different architecture entirely — see §7), but it shares the same outcome: no public IP addresses on serverless compute resources either.
+Serverless compute does not use the SCC relay (it's a different architecture) but its resources also have no public IPs.
 
-**Practical implication:** you don't need to open any inbound firewall rules for Databricks to function. If someone's proposing an inbound rule "to let Databricks reach the cluster," that's almost always unnecessary — the connection direction is the other way.
+**Practical implication:** you never open an inbound rule "so Databricks can reach the cluster." The connection direction is the other way. SCC is also a prerequisite for classic back-end PrivateLink.
 
----
+## 3. Non-Network Prerequisites (Cross-Account Role and Root Bucket)
 
-## 3. Non-Network Prerequisites Worth Knowing
+Every classic AWS deployment also needs two non-network objects that govern *who may act on your behalf*:
 
-Before the VPC-level decisions below, every AWS deployment (regardless of VPC choice) also needs two things that are easy to forget are part of "networking" in a broad sense, because they govern *who's allowed to act on your behalf*:
+- **Cross-account IAM role** — Databricks assumes it to launch and manage EC2 and related resources in your account. One role can be shared by multiple workspaces. With a customer-managed VPC, Databricks needs *fewer* permissions on this role than with the default setup, which often simplifies internal approvals.
+- **Root S3 bucket** (with the required bucket policy) — stores workspace assets such as cluster logs, notebook revisions and job results. One bucket can be shared across workspaces.
 
-- **A cross-account IAM role** in your AWS account, which Databricks assumes (via `sts:AssumeRole`) so it can launch and manage EC2 instances, EBS volumes, and other compute resources in your VPC. One role can be shared across multiple workspaces — you don't need a new one per workspace.
-- **A root S3 bucket** (with a specific required bucket policy) that stores workspace assets — cluster logs, notebook revisions, job results. Like the IAM role, one root bucket can be shared across multiple workspaces in an account, with data partitioned into per-workspace directories.
+Both can be created manually (Terraform/CloudFormation) or via **automated configuration**, where an AWS admin delegates temporary access so Databricks creates the role, bucket and (optionally) a customer-managed VPC for you.
 
-Both can be provisioned manually (Terraform, CloudFormation) or Databricks can provision them for you via **automated configuration**, where an AWS admin grants Databricks temporary delegated access to create the role, bucket, and policies directly. Automated configuration is the faster path for a first workspace; manual provisioning is typical once you're managing deployments as code.
+> **Policy note:** Databricks plans to deprecate classic workspace creation with a Databricks-managed VPC; **new classic workspaces will require a customer-managed VPC**. The simplest quick start is a **serverless workspace**, which has no classic compute plane (and therefore no VPC for you to manage).
 
-> **Policy note:** Databricks-managed VPCs are being phased out for new classic workspaces — a customer-managed VPC will soon be (or may already be, depending on when you're reading this) required for any new classic-compute workspace. Check current workspace-creation requirements before assuming a managed VPC is still an option.
+## 4. Customer-Managed VPC
 
----
+### 4.1 Managed vs. customer-managed
 
-## 4. VPC Options: Databricks-Managed vs. Customer-Managed
-
-| | Databricks-Managed VPC | Customer-Managed VPC |
+| | Databricks-managed VPC | Customer-managed VPC |
 |---|---|---|
-| **Who creates it** | Databricks, automatically, at workspace creation | You, before creating the workspace |
-| **Control over CIDR ranges, subnets, routing** | None | Full |
-| **PrivateLink support** | Not available | Required prerequisite |
-| **VPC peering to your other AWS resources** | Not possible | Supported |
-| **Custom security groups, NACLs, egress firewalling** | Not possible | Supported |
-| **Effort** | Zero — fastest path to a working workspace | You own subnet sizing, routing, NAT, endpoints |
+| Who creates it | Databricks, at workspace creation | You, before creating the workspace |
+| CIDR / subnet / routing control | Limited (default is a /16) | Full — smaller subnets possible |
+| Back-end & inbound PrivateLink | **Not supported** for classic workspaces | **Required** prerequisite |
+| Egress firewall / proxy appliance | Not practical | Supported — limit outbound traffic to an allow list |
+| Cross-account role permissions | More | Fewer |
+| Several workspaces share one VPC | No | Yes (recommended: unique subnets and security groups per workspace) |
+| VPC peering to other VPCs | Possible, but can be complex | Possible; often avoidable via smaller subnets and shared VPCs |
 
-**You cannot convert a Databricks-managed VPC into a customer-managed one after the fact** — the choice is made at workspace creation and is effectively permanent. Any production deployment with real governance or connectivity requirements should start with a customer-managed VPC.
+You must choose at workspace creation — **you cannot convert** an existing managed-VPC workspace to a customer-managed one. You *can* later move a customer-managed workspace from one VPC to another by updating its network configuration object.
 
-### Customer-managed VPC requirements
-- **Region:** the VPC must be in the same AWS region as the workspace.
-- **Subnets:** at least two subnets in different Availability Zones (a workspace can reference up to a handful of subnets total). Size them by expected cluster footprint, not a fixed CIDR guess — each cluster node consumes roughly two IPs, so subnet size should be driven by "how many concurrent nodes across all clusters, at peak, could this workspace run," not a one-size default. Undersized subnets are one of the most common causes of "cluster failed to launch" errors as usage grows.
-- **DNS:** `enableDnsHostnames` and `enableDnsResolution` must both be enabled on the VPC — required for PrivateLink to function, so it's worth enabling from day one even if you're not using PrivateLink yet.
-- **Security groups:** a workspace needs at least one, and can reference up to five. Required rules include a **self-referencing ingress rule** (allow all traffic from other resources in the same security group, so cluster nodes can talk to each other) and an egress rule allowing outbound traffic to the security group itself plus the internet (443 to the control plane, plus whatever else your workloads need to reach).
-- **NACLs:** Databricks requires an "allow all" rule on the subnet-level NACLs — the actual restriction happens at the security-group layer instead. This surprises teams used to locking down NACLs directly; it's a deliberate layered-security design, not an oversight, so don't fight it by adding NACL restrictions that duplicate the security group.
-- **NAT Gateway (or equivalent egress path):** needed so subnets without public IPs can still reach the internet/control plane outbound — standard pattern is private subnets routing through a NAT Gateway in a public subnet.
-- **VPC endpoints (recommended, required for full isolation):** S3 (Gateway endpoint), STS, and Kinesis interface endpoints let traffic to those AWS services stay on the AWS network backbone instead of routing out through the NAT Gateway and back in over the public internet. The Kinesis endpoint specifically exists for Databricks' own internal log/telemetry delivery, not something your workloads call directly — easy to assume it's optional and skip, but Databricks lists it as a standard best-practice endpoint alongside S3 and STS.
+Serverless-only workspaces and outbound (serverless) PrivateLink do **not** need a customer-managed VPC.
+
+### 4.2 VPC requirements (from the official page)
+
+- **Region:** same region as the workspace (check the regional-availability list).
+- **DNS:** `enableDnsHostnames` *and* `enableDnsResolution` must be on. Required for PrivateLink; enable from day one.
+- **Sizing:** Databricks assigns **two IPs per node** (one for management, one for Spark). The number of instances per subnet = **half the available IPs**.
+- **Subnet netmask:** each workspace subnet must be between **/17 and /26**. The VPC itself isn't limited, but must be large enough (two /26 subnets means the VPC is /25 or larger). For PrivateLink the VPC CIDR must be **at least /25**.
+- **Subnets:** at least **two, in different Availability Zones**; only **one subnet per AZ** can be given to a workspace. Subnets must be **private**. If you have secondary CIDR blocks, workspace subnets must come from the same VPC CIDR block.
+- **Egress path:** subnets need outbound access to the public network via a **NAT gateway + internet gateway**, or a customer-managed appliance. The NAT gateway sits in **its own subnet** that routes `0.0.0.0/0` to the internet gateway; the workspace subnets' route table sends `0.0.0.0/0` to the NAT gateway (or your proxy/firewall).
+- **Security groups:** **1 to 5** per workspace. Required rules:
+  - *Ingress:* allow all TCP and all UDP **from the same security group** (self-referencing).
+  - *Egress:* allow all TCP and UDP to the workspace security group itself, plus TCP to `0.0.0.0/0` on these ports:
+
+| Port | Purpose |
+|---|---|
+| 443 | Databricks infrastructure, cloud data sources, library repositories |
+| 3306 | Legacy Hive metastore |
+| 53 | DNS, when using custom DNS |
+| 6666 | Secure cluster connectivity — **only if using PrivateLink** |
+| 2443 | FIPS endpoints — **only with the compliance security profile** |
+| 5432 | Classic compute plane → Lakebase |
+| 8443, 8445 | Internal calls from compute plane to control-plane API |
+| 8444 | Unity Catalog logging and lineage streaming |
+| 8446–8451 | Reserved for future use |
+
+- **Subnet NACLs:** must **not deny** any traffic. Databricks validates at workspace creation: inbound `ALLOW ALL from 0.0.0.0/0` (must be prioritized), outbound allow to the VPC CIDR and TCP on 443, 3306, 6666 (PrivateLink), 8443, 8445, 8444. If you add other rules, give Databricks' rules the lowest rule numbers so they win. Restriction is meant to happen at the security-group and firewall layers, not the NACL.
+- **Don't over-restrict egress by IP:** if you use IP access lists, the NAT/egress public IPs must be on the allow list.
+
+### 4.3 Regional VPC endpoints (recommended)
+
+A customer-managed-VPC workspace must reach four AWS services: **S3, STS, Kinesis, and RDS** (RDS only for the legacy Hive metastore — not Unity Catalog — and there's no VPC endpoint for it). For the other three, create regional endpoints so in-region traffic stays on the AWS backbone, lowering cost and latency:
+
+- **S3** — a **gateway** endpoint attached to the route table(s) of the workspace subnets. Cross-region buckets require allowing the S3 global URL or a route to an internet gateway.
+- **STS** — an **interface** endpoint in the workspace subnets (use the workspace security group).
+- **Kinesis** — an **interface** endpoint, same pattern. It carries **Databricks' own log/telemetry delivery**, not your workloads' data. Exception: workspaces in `us-west-1`, whose Kinesis streams are cross-region.
+
+If endpoints don't take effect, set `AWS_REGION` on clusters (cluster policy) and/or the Spark `fs.s3a.endpoint` / `fs.s3a.stsAssumeRole.stsEndpoint` regional settings. Caution: applying the S3 regional Spark config at notebook/cluster level **blocks cross-region S3 access**.
+
+### 4.4 Egress firewall / proxy
+
+Databricks expects you to use an **egress firewall or proxy appliance** to block most traffic while allowing what Databricks needs. Specify destinations **by domain name, not IP**. Required allows include the Databricks web app, the SCC relay, S3 global (`s3.amazonaws.com:443`, root bucket), STS global and regional, the regional Kinesis URL, the legacy-Hive-metastore RDS URL (if used), and control-plane infrastructure. The region-specific values live on the "IP addresses and domains" reference page.
+
+### 4.5 Restricting S3 buckets (optional)
+
+Most S3 traffic is compute-plane-local, but some management operations originate in the control plane. To lock a bucket to known sources, use a **Deny** bucket policy (or a VPC endpoint policy). It must allow:
+- the **control-plane NAT IP and VPC IDs** for your region,
+- the compute plane via **`aws:sourceVpce`** (recommended) or its NAT IP,
+- with VPC endpoint policies: your **root bucket** plus the regional artifact/log/system-tables/shared-datasets buckets,
+- at least one **trusted IP (e.g. corporate VPN)** — Deny conditions apply even in the AWS console.
+
+When deploying a *new* workspace into a restricted bucket, you must temporarily allow a `us-west` control-plane NAT IP or deployment fails.
+
+### 4.6 Registering and changing the VPC
+
+- You register the VPC (ID, subnet IDs, security group IDs) as a **network configuration** in the account console/API.
+- A network configuration object **cannot be reused across workspaces** and, once created, **cannot be edited**.
+- Changing subnet CIDRs means: terminate clusters → delete subnets → recreate → fix route-table associations (a missed association makes clusters fail to launch) → create a new network configuration → update the workspace.
 
 ```hcl
-# Terraform — customer-managed VPC skeleton
+# Terraform skeleton — customer-managed VPC (sizes are illustrative: size for peak concurrent nodes)
 resource "aws_vpc" "databricks" {
   cidr_block           = "10.100.0.0/16"
   enable_dns_hostnames = true
-  enable_dns_support    = true
+  enable_dns_support   = true
 }
 
 resource "aws_subnet" "private_a" {
   vpc_id            = aws_vpc.databricks.id
-  cidr_block        = "10.100.0.0/19"   # size for peak concurrent cluster nodes, not a fixed default
+  cidr_block        = "10.100.0.0/19"   # allowed range is /17–/26
   availability_zone = "us-east-1a"
 }
 
@@ -96,118 +148,222 @@ resource "databricks_mws_networks" "this" {
   vpc_id             = aws_vpc.databricks.id
   subnet_ids         = [aws_subnet.private_a.id, aws_subnet.private_b.id]
   security_group_ids = [aws_security_group.databricks.id]
+  # For back-end PrivateLink, also reference the two registered VPC endpoints here
 }
 
 # Separately required: cross-account IAM role + root S3 bucket (see §3),
 # referenced via databricks_mws_credentials and databricks_mws_storage_configurations.
 ```
 
-### Reaching your other AWS resources
-Classic compute nodes **cannot talk to arbitrary EC2 instances or services sitting in the Databricks VPC** — the security group firewall rules block it by design, even if you've put something else in that same VPC. To let clusters reach resources elsewhere in your AWS footprint (an RDS database, an internal API), you need actual networking: **VPC peering** or a **Transit Gateway** connection from the Databricks VPC to the VPC where that resource lives, plus routing and security group rules on both sides.
+## 5. VPC Peering (Reaching Your Other AWS Resources)
 
----
+By default, classic compute is walled off: cluster workers talk only to workers of the **same cluster** and cannot freely reach other EC2 instances or AWS services running in the Databricks VPC. To reach things like RDS, Redshift, Kafka or Cassandra, either run them **outside** the Databricks VPC and **peer**, or (with a customer-managed VPC) allow it through your own security-group design.
 
-## 5. AWS PrivateLink
+Peering checklist (from the official page):
+1. The other VPC's CIDR must be **distinct** from the Databricks VPC and every destination already in its route table.
+2. Create the peering connection and **accept** it (cross-account needs the owner's approval).
+3. Enable **DNS resolution** on the peering connection **in both accounts**.
+4. Add routes to the **other VPC's CIDR** in the Databricks route table, **and** to the Databricks CIDR in the other VPC's route table.
+5. Add an **inbound rule** on the target's security group (e.g. 3306 for MySQL/Aurora) with the **Databricks worker security group** as source.
+6. Test from a cluster: `%sh nc -zv <host> <port>`; if the name doesn't resolve, check peering DNS settings and Route 53 private hosted zone associations.
 
-PrivateLink lets traffic between your network and the Databricks control plane travel entirely over the AWS backbone, never touching the public internet. There are three distinct PrivateLink connection types, and it's easy to conflate them:
+For many-to-many topologies, a Transit Gateway is the usual AWS alternative (standard AWS practice; not detailed on the Databricks pages).
 
-| Type | What it secures | Typical use |
-|---|---|---|
-| **Back-end PrivateLink** | Classic compute plane → control plane: REST API calls and the SCC relay | Keep cluster-management traffic off the public internet |
-| **Front-end PrivateLink** | Users' browsers/API clients → workspace UI and REST API | Keep end-user access off the public internet entirely |
-| **Browser authentication PrivateLink endpoint** | The SSO/login redirect flow specifically | Needed alongside front-end PrivateLink so authentication itself doesn't fall back to a public path |
+## 6. Classic (Back-End) PrivateLink
 
-**Prerequisites for any PrivateLink setup:**
-- A customer-managed VPC (mandatory — PrivateLink is not available on a Databricks-managed VPC).
-- Secure cluster connectivity already enabled (true by default for new workspaces).
-- DNS hostnames and DNS resolution enabled on the VPC.
+Back-end PrivateLink keeps **classic compute ↔ control plane** traffic off the public internet.
 
-**Back-end PrivateLink** requires creating two separate VPC interface endpoints — one for the workspace's REST API, one for the secure cluster connectivity relay — each pointed at the correct regional PrivateLink service name for your deployment.
+**Requirements:** Enterprise pricing tier; a **customer-managed VPC**; **secure cluster connectivity**; VPC with DNS hostnames/resolution enabled and a CIDR of at least /25; AWS permissions to create VPC endpoints.
 
-**Front-end PrivateLink** is what you add on top when you want to prevent the workspace URL itself from ever resolving to a public IP — commonly paired with private DNS so `*.cloud.databricks.com` for your workspace resolves privately inside your network.
+**Two VPC interface endpoints are needed** (both in the workspace region, created from the Databricks regional service names, with *Enable private DNS name* on):
+1. **Workspace endpoint** — Databricks REST APIs.
+2. **SCC relay endpoint** — cluster management tunnel (port **6666**; add **2443** with the compliance security profile).
 
-### The three common architecture tiers
-Databricks' own security architecture guidance frames deployments as a progression, so you can match effort to actual requirement rather than over-building:
+**Recommended design:**
+- A **dedicated subnet** for VPC endpoints with its own route table (only the local route).
+- **Two security groups:** the workspace SG, and an endpoint SG that allows inbound on the required ports **from the workspace SG** (no outbound rules needed; security groups are stateful).
+- VPC endpoints can be **shared across workspaces** that use the same customer-managed VPC.
 
-1. **Managed security (baseline)** — secure cluster connectivity + a customer-managed VPC. No open ports, no public IPs on compute, but control-plane traffic still exits over the public internet (encrypted, but not PrivateLink-routed).
-2. **Hardened connectivity** — adds context-based ingress rules (IP access lists — see §6), VPC endpoints for AWS services, and serverless egress controls.
-3. **Isolated environment** — adds inbound (back-end + front-end) PrivateLink and typically a required network firewall, for full private connectivity with effectively nothing routing over the public internet.
+**Databricks-side objects (registration order matters):**
+- **VPC endpoint registrations** — register each AWS endpoint with Databricks (can't be updated later).
+- **Network configuration** — references the VPC plus the two back-end registrations (can't be updated later).
+- **Private access settings (PAS)** — region-bound; one PAS can serve multiple workspaces in the same region.
+- Create/update the **workspace** with the network configuration and PAS. After status shows `RUNNING`, **wait about 20 minutes** before launching clusters.
 
-Most organizations land on tier 2; tier 3 is for environments with genuine regulatory or contractual requirements for zero public-internet exposure.
+**Connecting to S3/STS/Kinesis — two options:**
+- **Option 1 (standard):** keep NAT + internet gateway, with optional S3/STS/Kinesis endpoints.
+- **Option 2 (fully private / air-gapped):** *remove* NAT and internet gateway; S3 (gateway), STS and Kinesis (interface) endpoints become **mandatory**. Use a private subnet of at least /27 for the interface endpoints and an SG allowing 443 from the workspace SG.
 
----
+**Verify** from a notebook: call a workspace REST API with a PAT, and run `%sh nslookup <workspace-url>` — the answer must be the **private IP** of your endpoint. A public answer means DNS is misconfigured even if the call succeeds.
 
-## 6. IP Access Lists
+## 7. Inbound Networking: Users → Databricks
 
-A simpler, complementary control to PrivateLink: **IP access lists** restrict which public IP ranges are even allowed to reach the workspace UI/API at all — an allow/deny list evaluated before a request is let through.
+Features here require the Enterprise plan.
 
-- Good for restricting access to known corporate IP ranges or a VPN/bastion exit IP.
-- Works independently of PrivateLink — you can use IP access lists alone, PrivateLink alone, or both together (PrivateLink traffic typically needs its own allow entry if access lists are also enforced).
-- Applies at the workspace level and also affects Databricks Apps traffic, since Apps run on the same ingress path.
+### 7.1 Inbound (front-end) PrivateLink
 
----
+- Routes users' access to the web app, REST APIs, Databricks Apps and Databricks Connect through a **VPC interface endpoint**, usually in a **transit VPC** (often separate from the compute VPC, and reachable from on-premises via Direct Connect or VPN; TCP 443 must be allowed from client networks).
+- You create **one endpoint type: "General Access (including REST API)"**, register it in the account console (*Security → Private endpoints*), and attach a policy. A General Access endpoint in **any region** can serve workspaces in **any region**, and one endpoint can be shared across Databricks accounts by registering it in each.
+- Classic workspaces need a **customer-managed VPC** for inbound PrivateLink.
 
-## 7. Serverless Networking
+> **Correction to earlier guidance:** current docs describe a single *General Access* endpoint for inbound access; there is no separate "browser authentication endpoint" in the current model. For users without public-internet access, SSO via **unified login** redirects to `accounts.cloud.databricks.com`, which needs an extra IdP redirect URI and a private hosted zone (private access to account-level resources is in **Beta**).
 
-Serverless compute (serverless SQL warehouses, serverless jobs/notebooks, serverless pipelines, Databricks Apps, Model Serving) runs in a **Databricks-managed compute plane**, not in your VPC — so the customer-managed-VPC model above doesn't directly apply. Serverless has its own networking primitive: the **Network Connectivity Configuration (NCC)**.
+### 7.2 Deciding who may use the endpoint
 
-An NCC is created once and then attached to one or more workspaces, and it controls how serverless compute reaches the outside world:
+Two mechanisms, both of which must allow the endpoint:
+- **Private access settings (PAS)** — all-or-nothing, region-bound.
+- **Context-based ingress (CBI)** — fine-grained policies combining identity, request type and network source (public IP ranges or specific private endpoints); not region-bound. Default is *Allow access from all private endpoints*, deferring to PAS. If you use CBI, attach an "allow all" PAS so CBI makes the decision. Workspaces with **no PAS attached deny all private access**.
+- Test in **Dry run mode** first; denials are logged to `system.access.inbound_network` but don't block. Changes take under ~10 minutes. One policy per workspace, but a policy can be shared by many.
 
-- **Stable IP addresses** — serverless egress traffic comes from a fixed, published set of public IPs you can safely allowlist on external systems (a database, an API), instead of serverless traffic appearing to come from an unpredictable address range.
-- **Private endpoint rules** — configure PrivateLink connections from the serverless compute plane to specific destinations (your VPC resources, an AWS service), so serverless egress to that destination stays off the public internet too.
-- **Private network gateway** (newer capability, in private preview at time of writing — confirm current availability before relying on it) — complements private endpoint rules by letting you route *all* serverless egress for a workload through your own firewall or dedicated egress path, and gives you a single, identifiable set of source IPs for that traffic, reusing the same NCC you already have rather than introducing a separate object.
+### 7.3 DNS
 
-```
-1. Create an NCC (name, region)
-2. Add private endpoint rules for specific destinations you want privately reachable
-   (or configure stable-IP egress for simple IP allowlisting)
-3. Attach the NCC to your workspace(s)
-```
+Every workspace has two URLs: the **workspace-specific** URL (`dbc-…cloud.databricks.com`) — **always** route it to the endpoint — and your **custom** URL, which you must also route if you use it. Verify with `nslookup`: the workspace-specific URL should show a **`privatelink`** canonical name and a private IP; if not, no PAS is attached. Workspaces with **managed disaster recovery** use the custom URL as a stable URL and need a failover General Access endpoint allowlisted to both primary and secondary workspaces.
 
-A common pattern for reaching an internal database from serverless compute: stand up a Network Load Balancer (NLB) in front of the database in your VPC, create a VPC endpoint service from it, then build the NCC's private endpoint rule against that endpoint service — effectively PrivateLink, initiated from the serverless side.
+### 7.4 IP access lists
 
----
+- Allow/block lists on the **public** source IP of requests, for **workspaces** (REST API) and the **account console**. Block lists are evaluated first; with no allow list, everything is allowed; account console max **1000** values; changes take a few minutes.
+- **IP access lists apply only to public-internet requests.** They cannot block private IPs arriving over PrivateLink — use AWS Network Firewall, a PAS `ENDPOINT` access level, or CBI "Selected private endpoints" for that.
+- **Both controls apply together** with CBI. Databricks recommends CBI as the primary mechanism and provides a migration path from IP access lists.
 
-## 8. Unity Catalog and Networking
+### 7.5 Domain firewalls
 
-Unity Catalog's governance model (covered in depth separately) has a few networking-specific touchpoints worth knowing:
+If your organization blocks by domain, allowlist the Databricks domains. Databricks also validates the **Host header** and rejects requests for non-Databricks domains.
 
-- **Storage access** — classic compute reaches governed S3 buckets using the IAM role tied to the storage credential, routed per the VPC's own networking (ideally via an S3 VPC endpoint, as noted in §4).
-- **Lakehouse Federation** — querying an external database (Postgres, Snowflake, Redshift, etc.) through a UC `CONNECTION` needs real network reachability between Databricks compute and that database, same as any other service: stable-IP allowlisting from serverless, or PrivateLink when the external system lives on AWS and you want it kept off the public internet.
-- **Credential vending** to external engines (non-Databricks Spark, DuckDB, Iceberg REST clients) similarly depends on those clients having network reachability to both the UC REST endpoint and the underlying cloud storage — it rides on whatever networking path you've already built, rather than introducing a new one.
+## 8. Reference Architectures (Three Tiers)
 
----
+Start at Managed security and add controls as requirements grow. Most organizations harden ingress and egress before going fully private.
 
-## 9. Common Gotchas
+| Feature | Managed security | Hardened connectivity | Isolated environment |
+|---|---|---|---|
+| Secure cluster connectivity | ✅ | ✅ | ✅ |
+| Customer-managed VPC | ✅ | ✅ | ✅ |
+| Classic (back-end) PrivateLink | Optional | ✅ | ✅ |
+| Workspace inbound PrivateLink | ❌ | ❌ | ✅ |
+| Inbound PrivateLink for performance-intensive services | ❌ | ❌ | ✅ |
+| Workspace / account / OpenSharing IP access lists | ❌ | ✅ | ✅ |
+| Serverless egress control | ❌ | ✅ | ✅ |
+| Serverless PrivateLink (NCC private endpoints) | ❌ | ✅ | ✅ |
+| Serverless firewall allowlisting (stable IPs) | ✅ | ✅ | ✅ |
+| External firewall | Optional | Optional | ✅ (required) |
 
-- **"My cluster can't reach my RDS instance"** — almost always a missing VPC peering/Transit Gateway connection, or a security group on the RDS side that doesn't allow the Databricks VPC's CIDR range. Remember clusters can't freely reach *anything* outside their own security group rules, including other resources in the same VPC.
-- **"PrivateLink setup isn't working"** — check DNS hostnames/resolution are actually enabled on the VPC first; this is the most commonly skipped prerequisite, and PrivateLink silently fails (or falls back to public resolution) without it.
-- **"Workspace creation failed, subnet too small"** — classic compute subnets need real headroom for autoscaling; undersized `/26`-ish subnets work fine for a demo and then fail under real load.
-- **Confusing front-end and back-end PrivateLink** — back-end alone secures cluster-to-control-plane traffic but still leaves users hitting the workspace URL over the public internet; if the requirement is "no public internet exposure at all," you need both, plus the browser authentication endpoint.
-- **Serverless "stable IP" vs. classic compute IP** — these are two unrelated concepts (NCC stable IPs for serverless vs. your VPC's own NAT Gateway IP for classic); don't assume allowlisting one covers the other if your workloads use both.
-- **Databricks-managed VPC chosen by default, PrivateLink needed later** — can't be fixed in place; requires creating a new workspace on a customer-managed VPC and migrating.
+- **Managed security** — secure defaults; apply Unity Catalog governance on top.
+- **Hardened connectivity** — auditability and access control *without* eliminating public endpoints.
+- **Isolated environment** — everything private; for regulated industries with strict exfiltration requirements.
 
----
+## 9. Serverless Compute Plane Networking
 
-## 10. Quick Reference
+Serverless runs in the Databricks-managed serverless plane, so your VPC settings don't apply. Instead there are **network connectivity configurations (NCCs)** and **network policies**.
 
-| Concept | What it governs |
+### 9.1 NCCs
+
+- An **account-level, regional** object that manages **private endpoint creation** and rules.
+- Attach one NCC to **many workspaces in the same region**; all its private endpoint rules apply to them.
+- Limits: **10 NCCs per region per account**, **30 private endpoints per region** (spread across NCCs), **50 workspaces per NCC**, **100 domain names per private endpoint rule** (VPC-resource rules). No DNS chasing/redirects: names must resolve directly to the backend.
+- An NCC can also be attached to a **metastore** for **OpenSharing SecureConnect** private connectivity.
+
+### 9.2 Firewalling your resources for serverless (the stable-IP change)
+
+> **Correction:** earlier guidance described "stable IPs" as an NCC feature. The **legacy NCC stable-IP list was deprecated (May 25, 2026)** and removed from the NCC UI/API. Still using it can cause `403 Forbidden` from serverless.
+
+Current method depends on the resource:
+- **S3 buckets in the workspace's region:** use the **`aws:VpceOrgPaths`** condition key in the bucket policy with the Databricks serverless OrgPath (serverless VPCs each have an S3 gateway endpoint; gateway endpoints are regional).
+- **Everything else:** allowlist the published outbound CIDRs from **`ip-ranges.json`** (**Public Preview**) — filter for `service = Databricks`, `type = outbound`, your `region`, `platform = aws`. **Automate the refresh:** updates publish as often as every 30 days and new IPs go live ~60 days after publication; compare the file's `timestampSeconds`.
+- Serverless connects over **IPv4 only**; firewall rules also affect classic compute, so allow its networks too.
+
+### 9.3 Private connectivity (PrivateLink) from serverless
+
+**To resources in your VPC (via NLB):** (Enterprise plan)
+1. Internal **Network Load Balancer** in front of the resource.
+2. **VPC endpoint service** on it, with *acceptance required*, *Enforce inbound rules on PrivateLink traffic* **off**, and the Databricks serverless stable IAM role (`private-connectivity-role-<region>`) — or `*` for simplicity — in *Allow principals*. Cross-region requires two AZs and adding the consumer region.
+3. Create an **NCC** (same region as the workspace).
+4. Add a **private endpoint rule**: endpoint service name + the destination **FQDN(s)** (e.g. the RDS hostname).
+5. **Accept** the connection request in the AWS console; wait for status **`ESTABLISHED`**.
+6. **Attach the NCC** to workspaces.
+
+Domains added via private endpoint rules are **implicitly allowlisted** in network policies. RDS Multi-AZ has no stable IPs, so NLB target IPs need automated sync.
+
+**To AWS-managed resources (Public Preview):** supported targets include **S3 (and S3 FIPS), DynamoDB, STS, Secrets Manager, KMS, Glue, Lambda, SNS, SQS, EMR, RDS APIs, Redshift (incl. Data API/Serverless), and Bedrock**.
+- S3 supports per-bucket scoping (up to 100 buckets per rule, one S3 rule per region); other types apply to all traffic for that resource type in attached workspaces.
+- Access S3 via the **regional** DNS name (`<bucket>.s3.<region>.amazonaws.com`); global names aren't supported.
+- **Restrict the resource first, then enable the rule.** Use an explicit **Deny** unless `aws:SourceVpce` matches — but also allow admin roles/VPN, or you can lock yourself out of the console. For S3, also allow the Databricks control plane (Unity Catalog reaches the bucket from there).
+- These endpoints cover **service APIs**, not direct JDBC/ODBC connections to RDS/Redshift instances.
+
+### 9.4 Serverless egress control (network policies)
+
+Previously missing from this guide. A **network policy** (account-level object; one per workspace, sharable across workspaces; Enterprise tier) governs outbound traffic from serverless products — notebooks, workflows, SQL warehouses, Lakeflow pipelines, Model Serving, Data Quality Monitoring, and Apps (limited support).
+
+- **Full access** — unrestricted outbound.
+- **Restricted access** — deny-by-default. Allowed: **Unity Catalog external locations** (same region as the bucket), **FQDNs and S3 buckets listed in the policy**, and the **same workspace's** APIs. Always allowed: the workspace S3 bucket, essential system tables, sample datasets.
+- Direct storage access from user code (UDFs/notebooks) is prohibited in restricted mode — use Unity Catalog or DBFS mounts.
+- Private-endpoint traffic is **also** subject to the policy.
+- External model endpoints and external **MCP servers** need their DNS names added.
+- Use **dry-run mode** before enforcing.
+- **Cross-workspace access** is separate: allowed only if both the source's egress rules and destination's ingress rules permit it.
+
+### 9.5 Private network gateway **(Private Preview, unlisted docs page)**
+
+Connects serverless compute to your VPC and transitively connected networks (e.g. on-premises over Direct Connect/VPN) through one managed gateway — you supply a subnet, a cross-account IAM role and a security group.
+- Egress paths are evaluated in priority order: **private endpoint rules → S3/DynamoDB gateway endpoints → private network gateway → default Databricks egress**.
+- Two modes: **`SPECIFIC_DESTINATIONS`** (recommended; destination suffix matching) and **`ALL_TRAFFIC`** (must add destinations to the egress policy yourself).
+- Limits in preview: one subnet in one AZ, **API-only configuration (no UI or Terraform)**, max two gateways per NCC, 100 destinations. Doesn't reach AWS-managed services behind gateway/interface endpoints.
+
+## 10. Data-Access Touchpoints
+
+### 10.1 The S3 commit service
+
+Delta Lake, Structured Streaming, Auto Loader and `COPY INTO` use a **commit service in the control plane** to guarantee consistent writes (S3 can't do "put if absent"). Clusters write data directly to S3; the commit service finalizes the commit-log multipart upload and **never reads** your data.
+- By default, temporary credentials are sent to the control plane (instance-profile credentials last six hours).
+- Instance-profile users may see **GuardDuty** `InstanceCredentialExfiltration` alerts; Unity Catalog–managed tables **don't** trigger them. Mitigation: a token-based instance profile that assumes the data role.
+- Optional: disable the *direct upload optimization* (`spark.hadoop.fs.s3a.databricks.s3commit.directPutFileSizeThreshold = 0`), at a small cost for tiny near-real-time streaming updates.
+- Include control-plane IPs in any S3 IP-restriction policy.
+
+### 10.2 Unity Catalog and federation
+
+- Classic compute reaches governed buckets via the IAM role of the storage credential, ideally through an S3 gateway endpoint.
+- **Lakehouse Federation / external databases:** need real reachability — private endpoint rules or published IPs from serverless; VPC peering/endpoints from classic.
+- **Credential vending** to external engines relies on those clients reaching both UC and storage over your existing paths.
+
+## 11. Networking Costs
+
+- **Classic compute:** you pay AWS directly for networking.
+- **Serverless:** Databricks charges for private connectivity (per GB; per-hour endpoint fees expected later), public connectivity (per GB), and data transfer (cross-AZ, cross-region, internet). **In-region S3 access from serverless uses gateway endpoints and is not charged.**
+- **Performance-intensive services** (Lakebase, OpenSharing SecureConnect, Zerobus, Files API): cross-region and public-internet **egress back to clients** is charged for all customers. Ordinary UI/API traffic is not.
+- Create workspaces in the **same region as your data** to avoid cross-region charges. Usage appears in the billable-usage system table.
+
+## 12. Common Gotchas
+
+- **Cluster can't reach my database** → missing peering/route on one side, overlapping CIDRs, DNS resolution not enabled on the peering connection, or the target SG not allowing the Databricks worker SG.
+- **PrivateLink not working** → DNS hostnames/resolution disabled; endpoint DNS not private (`nslookup`); no PAS attached; didn't wait ~20 minutes after `RUNNING`.
+- **Workspace creation / cluster launch fails** → NACL denying required ports; subnet not private or no NAT route; undersized subnet (remember two IPs per node); wrong route-table association after a CIDR change.
+- **Only back-end PrivateLink configured** → users still reach the UI over the public internet; add inbound PrivateLink plus CBI/PAS and disable public access *after* DNS is verified.
+- **IP access lists don't block my PrivateLink users** → by design, they only see public IPs.
+- **Serverless gets `403 Forbidden` after May 2026** → still using the deprecated NCC stable-IP list; migrate to `ip-ranges.json` / VPCE OrgPath.
+- **Locked out of my own S3/DynamoDB resource** → Deny policy applied without allowing admin roles/VPN.
+- **Restricted egress broke an app/model** → external model providers, MCP servers and S3 DNS names must be in the network policy's allowed domains.
+- **Reusing network objects** → network configurations and VPC endpoint registrations are immutable; plan to create new ones rather than edit.
+- **Chose a managed VPC** → can't be converted; and managed-VPC classic workspaces will stop being creatable.
+
+## 13. Quick Reference
+
+| Concept | What it does |
 |---|---|
-| Control plane | Databricks-managed: UI, scheduler, cluster manager, UC metadata |
-| Compute/data plane | Your AWS account (classic) or Databricks-managed compute plane (serverless) |
-| Secure Cluster Connectivity (SCC) | No public IPs, no open inbound ports, outbound-only relay tunnel |
-| Cross-account IAM role | Lets Databricks launch/manage EC2 and related resources on your behalf |
-| Root S3 bucket | Stores workspace assets: cluster logs, notebook revisions, job results |
-| Databricks-managed VPC | Zero-config, no PrivateLink, no peering — being phased out for new classic workspaces |
-| Customer-managed VPC | Full control; required for PrivateLink, peering, custom security groups |
-| Back-end PrivateLink | Classic compute ↔ control plane (REST API + SCC relay) stays private |
-| Front-end PrivateLink | User access to workspace UI/API stays private |
-| Browser authentication PrivateLink | SSO/login flow stays private (pairs with front-end) |
-| IP access lists | Allow/deny by public IP range, independent of PrivateLink |
-| NCC (Network Connectivity Configuration) | Serverless compute's networking control: stable IPs, private endpoints, gateway |
-| Private network gateway | Route all serverless egress through your own firewall/egress path |
-| VPC peering / Transit Gateway | Let classic compute reach other resources in your AWS footprint |
+| Control plane / compute planes | Databricks-managed services vs. classic (your VPC) and serverless (Databricks-managed) compute |
+| SCC | No public IPs, no open inbound ports; outbound relay tunnel |
+| Cross-account IAM role / root bucket | Delegated EC2 management / workspace asset storage |
+| Customer-managed VPC | Your VPC; required for back-end and inbound PrivateLink on classic workspaces |
+| Network configuration | Registered VPC + subnets + SGs (+ back-end endpoints); immutable, not reusable |
+| Back-end PrivateLink | Workspace + SCC relay endpoints; private classic↔control-plane traffic |
+| Inbound PrivateLink | General Access endpoint in a transit VPC for users |
+| Private access settings (PAS) | Region-bound allow/deny for private access |
+| Context-based ingress (CBI) | Identity + request type + network source policies; dry-run supported |
+| IP access lists | Public-IP allow/block lists; don't affect PrivateLink traffic |
+| NCC | Regional, account-level serverless networking object; hosts private endpoint rules |
+| Private endpoint rule | PrivateLink from serverless to NLB-fronted VPC resources or AWS-managed services |
+| Serverless egress control | Network policies: full vs. restricted (deny-by-default) access |
+| VPCE OrgPath / `ip-ranges.json` | Current ways to firewall resources for serverless |
+| Private network gateway (Preview) | Managed gateway from serverless into your VPC / connected networks |
+| S3 commit service | Control-plane service ensuring consistent Delta/streaming writes |
 
 ---
 
-*Sources: Databricks official AWS networking and security architecture documentation, including classic compute plane networking, PrivateLink, serverless network security, and Databricks Apps networking pages.*
+*Sources: docs.databricks.com/aws/en/security/network/ and subpages — Networking overview; Network reference architecture overview; Classic compute plane networking; Customer-managed VPC; VPC peering; Classic (back-end) PrivateLink; Inbound PrivateLink; IP access lists; Serverless compute plane networking; Serverless firewall configuration; Private connectivity to resources in your VPC and to AWS-managed resources; Serverless egress control; Private network gateway; S3 commit service; Networking costs.*
