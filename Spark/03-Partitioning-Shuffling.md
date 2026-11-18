@@ -1,4 +1,4 @@
-# Spark Partitioning & Shuffling — Complete Guide
+# Spark Partitioning & Shuffling
 
 ---
 
@@ -6,16 +6,12 @@
 
 Partitioning determines how data is split across a cluster; shuffling is what happens when that split has to change mid-job. Nearly every expensive thing that can happen in a Spark application — network-bound stages, disk spill, data skew, OOMs, small-file problems on write — traces back to how data was partitioned and when it had to be reshuffled. Unlike most tuning levers, which optimize one stage, getting partitioning right changes the shape of the *entire* job, because partition count and distribution propagate forward through every subsequent transformation until the next shuffle resets them.
 
----
-
 ## 2. What a Partition Actually Is
 
 - A **partition** is a logical division of a distributed dataset (RDD/DataFrame). A task processes one partition for a stage attempt; the partition is not permanently owned by an executor and its data may be fetched from storage or another executor.
 - Partitions are the unit of **parallelism** — the number of partitions roughly caps the number of tasks that can run concurrently for a given stage (bounded further by available executor cores).
 - Every partition's data, when an RDD is created from an external source, is typically determined by that source's own splitting logic — e.g., HDFS/S3 file splits, Parquet row-group boundaries, or a JDBC query's partitioning column.
 - A partition is not inherently tied to a physical machine permanently — it's a logical division that Spark schedules tasks against; a given partition could be processed on different executors across retries or re-execution.
-
----
 
 ## 3. How Initial Partition Count Is Determined
 
@@ -66,8 +62,6 @@ The one-line warning above (`§3`, "a single unsplittable compressed file cannot
 3. **Pre-split the file before it reaches Spark** — e.g., splitting one giant gzip file into many smaller gzip files upstream (each individually unsplittable, but now there are enough of them that Spark can at least assign one per task, restoring task-level parallelism even without true in-file splitting).
 4. **Decompress to plain text first** (trading storage space for splittability) if converting formats or re-compressing isn't feasible — makes the file trivially splittable again at the cost of disk space and losing compression's storage/IO benefits.
 
----
-
 ## 4. Partitioning Schemes: Hash, Range, and Custom
 
 **Hash Partitioning (the default for most shuffles)**
@@ -89,8 +83,6 @@ The one-line warning above (`§3`, "a single unsplittable compressed file cannot
 - At the RDD API level, a custom `Partitioner` subclass can implement arbitrary logic for `getPartition(key)` — useful for domain-specific distribution requirements a hash or range partitioner can't express (e.g., co-locating specific known key groups together, or implementing a partitioning scheme that matches an external system's own sharding for efficient joins against it).
 - The DataFrame/SQL API doesn't expose custom partitioners directly in the same way, though `repartition(n, col1, col2, ...)` gives hash-based control over which columns drive the partitioning without a fully custom implementation.
 
----
-
 ## 5. Shuffle Mechanics: What Actually Happens on the Wire
 
 A shuffle is triggered by any **wide transformation** — an operation where an output partition can depend on data from many/all input partitions (`groupByKey`, `join`, `distinct`, `repartition`, any aggregation requiring grouping by key). Understanding its internal steps explains most shuffle-related tuning:
@@ -106,15 +98,11 @@ The cost of a shuffle is therefore **disk I/O (write + spill) + network I/O (fet
 
 **A related internal detail worth knowing:** sort-based shuffle has a **bypass mode** (`spark.shuffle.sort.bypassMergeThreshold`, default 200) — when the number of output (reduce-side) partitions is at or below this threshold, Spark skips the sort step on the write side entirely and just writes one file per partition directly, since sorting isn't worth the overhead at low partition counts. Do not infer any relationship between the default `spark.sql.shuffle.partitions` value (200) and the bypass threshold; they are separate settings with separate purposes.
 
----
-
 ## 6. Narrow vs Wide Transformations, Revisited Through a Shuffle Lens
 
 - **Narrow:** each output partition depends on a known, limited set of input partitions (often exactly one) — no shuffle, can be pipelined within a single stage (`map`, `filter`, `union`).
 - **Wide:** output partitions can depend on data from many/all input partitions — requires a shuffle, creates a new stage boundary.
 - A job's **stage count** is directly determined by how many wide transformations it contains — each shuffle ends one stage and begins the next. Minimizing unnecessary wide transformations (or replacing them with narrow-equivalent alternatives, like `reduceByKey`'s map-side pre-combine instead of `groupByKey`'s full shuffle-then-group) is one of the highest-leverage structural optimizations available, because it removes an entire category of cost rather than tuning around it.
-
----
 
 ## 7. Repartition vs Coalesce — Not Interchangeable
 
@@ -134,8 +122,6 @@ A common mistake: using `coalesce()` to *increase* parallelism (it simply won't,
 
 **Checking actual partition count directly** (rather than inferring it from configuration) is straightforward and worth knowing: `df.rdd.getNumPartitions()` — useful for confirming what a chain of operations actually produced, since defaults, AQE coalescing, and upstream shuffles can all make the real number diverge from what a config value alone would suggest.
 
----
-
 ## 8. Adaptive Query Execution and Partitioning
 
 AQE (`spark.sql.adaptive.enabled`, default `true` in modern Spark) directly addresses two of the biggest static-partitioning pain points:
@@ -145,8 +131,6 @@ AQE (`spark.sql.adaptive.enabled`, default `true` in modern Spark) directly addr
 
 AQE operates at **shuffle (query stage) boundaries only** — it re-plans the remainder of the query after a stage completes, using that stage's actual output statistics; it has no effect on the initial partitioning of a freshly-read source, which is still governed by the read-time logic in §3.
 
----
-
 ## 9. Partitioning on Write, and the Small-File Problem
 
 `df.write.partitionBy("col1", "col2").parquet(path)` physically lays data out into a directory structure (`col1=value1/col2=value2/...`), which is distinct from the in-memory/shuffle partitioning discussed above but closely related in practice:
@@ -155,8 +139,6 @@ AQE operates at **shuffle (query stage) boundaries only** — it re-plans the re
 - **The small-file problem:** if the DataFrame being written has many partitions (in the Spark/shuffle sense) relative to the number of distinct `partitionBy` values, each in-memory partition writes its own file per output directory — leading to many small files, which is expensive for downstream reads (file-open overhead, metadata overhead on systems like HDFS/S3) and for the catalog tracking them.
 - **Standard mitigation:** `repartition(n, "col1", "col2")` (matching the write-partitioning columns) immediately before the write, so that each output directory gets a controlled, reasonable number of files rather than one per original Spark partition. `coalesce()` can also reduce file count cheaply when even redistribution isn't required.
 - **Over-partitioning on write** (too many distinct partition column combinations, e.g., partitioning by a high-cardinality column like a raw timestamp or a user ID) produces an explosion of tiny partitions/files and metadata overhead — a frequent design mistake distinct from the in-memory shuffle-partition-count mistake, but caused by the same underlying "too many small pieces" failure mode.
-
----
 
 ## 10. Data Skew — When Partitioning Breaks Down
 
@@ -171,8 +153,6 @@ Skew is what happens when a chosen partitioning scheme (almost always hash-based
   4. **Pre-aggregate before the shuffle**, where the use case allows it, reducing the absolute row count the skewed key carries into the shuffle even if the relative skew ratio is unchanged.
 - Skew is a **data distribution problem**, not a partition-*count* problem — increasing `spark.sql.shuffle.partitions` does nothing for a hash-partitioned hot key, since every row for that key still lands in the same single partition regardless of how many partitions exist in total.
 
----
-
 ## 11. Bucketing: Pre-Partitioning at Rest
 
 Distinct from both in-memory partitioning and directory-based `partitionBy`, **bucketing** (`.bucketBy(n, "key").saveAsTable(...)`) pre-partitions data into a fixed number of hash buckets **at write time**, persisted as part of the table's physical layout:
@@ -182,16 +162,12 @@ Distinct from both in-memory partitioning and directory-based `partitionBy`, **b
 - Unlike `partitionBy`, bucketing doesn't create a directory-per-value structure (avoiding the high-cardinality small-file explosion risk from §9) — it creates a fixed number of files per bucket, regardless of key cardinality.
 - Two practical constraints worth knowing: bucketing is only fully supported via `saveAsTable` (a catalog-registered, typically Hive-compatible table) rather than a plain `.parquet(path)` write, since the bucketing metadata needs to be tracked somewhere; and the shuffle-free join optimization itself is gated by `spark.sql.sources.bucketing.enabled` (on by default), which must be true for Spark to actually recognize and exploit matching bucketing between two tables at join time.
 
----
-
 ## 12. Dynamic Partition Pruning (DPP)
 
 A runtime optimization specifically for joining a **partitioned** (via `partitionBy` at write time) fact table against a filtered dimension table:
 
 - If a dimension table is filtered (`WHERE region = 'EU'`) and then joined to a large fact table partitioned by that same column, DPP pushes the dimension-side filter into the fact table's **partition pruning at runtime**, reading only the fact table partitions that could possibly match rather than scanning the whole table.
 - Controlled by `spark.sql.optimizer.dynamicPartitionPruning.enabled` (on by default in modern Spark); entirely dependent on the fact table actually being partitioned on the relevant join/filter column at the storage layer — it has no effect otherwise.
-
----
 
 ## 13. Diagnosing Partitioning/Shuffle Problems
 
@@ -207,7 +183,6 @@ A runtime optimization specifically for joining a **partitioned** (via `partitio
 | A stage appears to re-run or "hang" after seemingly completing | `FetchFailedException` from a lost executor (spot/preemptible termination, OOM kill, aggressive scale-down) forcing shuffle output recomputation | Executor loss events in the Spark UI/logs; whether the external shuffle service is enabled; `spark.stage.maxConsecutiveAttempts` |
 | A read stage shows exactly 1 task taking far longer than everything else, on a large single file | The source file is unsplittable (e.g., gzip-compressed CSV/JSON) — the whole file is one partition by construction | File format/compression (§3.1); whether converting to Parquet/ORC or a splittable codec (bzip2, LZO+index) is feasible |
 
----
 
 ## 14. Configuration Reference
 
@@ -229,33 +204,3 @@ A runtime optimization specifically for joining a **partitioned** (via `partitio
 | `spark.shuffle.sort.bypassMergeThreshold` | 200 | Reduce-side partition count at/below which shuffle write skips sorting entirely. |
 | `spark.stage.maxConsecutiveAttempts` | 4 | Retry limit for a stage before the job fails outright after repeated shuffle fetch failures. |
 | `spark.sql.sources.bucketing.enabled` | true | Gates whether Spark recognizes and exploits matching bucketing between two tables for shuffle-free joins. |
-
----
-
-## 15. Practical Tuning Checklist
-
-- [ ] Target roughly 128MB–256MB of data per partition as a starting heuristic — neither hundreds of MB-sized partitions nor thousands of tiny ones.
-- [ ] Check whether `spark.sql.shuffle.partitions` (flat default 200) actually fits the job's data size, or whether AQE coalescing is already handling it adequately.
-- [ ] Before writing partitioned output, `repartition()`/`coalesce()` by the write-partitioning columns to avoid a small-file explosion.
-- [ ] Check for skew directly (distinct key counts, per-task shuffle size) rather than assuming AQE caught it.
-- [ ] Use `coalesce()` instead of `repartition()` when reducing partition count and even redistribution isn't required — it's materially cheaper.
-- [ ] For JDBC reads of large tables, always specify partitioning options rather than relying on the single-connection default.
-- [ ] For frequently-repeated joins on the same large tables, evaluate whether bucketing removes the shuffle cost entirely.
-- [ ] Avoid partitioning writes by high-cardinality columns (raw timestamps, user IDs) — prefer coarser-grained columns (date, region) that still support useful pruning without exploding file/directory count.
-- [ ] Confirm the external shuffle service is enabled when using dynamic allocation, so executor deallocation doesn't force shuffle recomputation.
-- [ ] If stages appear to silently re-run, check for `FetchFailedException`/executor loss before assuming it's a logic or data issue.
-- [ ] Use `df.rdd.getNumPartitions()` to confirm actual partition counts rather than inferring them purely from configuration.
-- [ ] For large source files, confirm the format/compression combination is actually splittable (§3.1) before assuming `maxPartitionBytes` will parallelize the read — a single large gzip file won't split no matter what that config says.
-
----
-
-## 16. A Concise Mental Model
-
-- **Partition count determines parallelism; partition distribution determines whether that parallelism is actually usable.** Even partition counts with skewed data still bottleneck on the largest partition.
-- **A shuffle is a stage boundary**, and its cost is disk (write + spill) plus network (fetch) plus serialization — avoiding unnecessary wide transformations removes this cost category entirely rather than just reducing it.
-- **`repartition()` reshuffles and rebalances; `coalesce()` merges cheaply without rebalancing** — they solve different problems and aren't interchangeable.
-- **AQE fixes the two biggest static-partitioning pain points** (wrong flat shuffle-partition count, and skew) automatically at shuffle boundaries, but doesn't touch initial read-time partitioning.
-- **Bucketing and `partitionBy` solve different problems**: bucketing eliminates shuffle cost for repeated joins; `partitionBy` enables partition pruning on filtered reads — and both can go wrong the same way (too many small files) if cardinality isn't considered.
-- **Skew is a distribution problem that more partitions can't fix** — it requires addressing the key distribution itself, not the partition count.
-- **Round-robin, not hash, is what plain `repartition(n)` actually uses** — hash partitioning only applies once specific columns are given, which is the detail most likely to be misremembered about this pair of APIs.
-- **Lost shuffle data triggers recomputation, not just a stage failure** — a seemingly "hanging" stage after apparent completion is frequently `FetchFailedException` recovery, not a logic problem.
