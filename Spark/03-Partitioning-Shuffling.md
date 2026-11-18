@@ -1,7 +1,5 @@
 # Spark Partitioning & Shuffling
 
----
-
 ## 1. Why This Topic Sits at the Center of Spark Performance
 
 Partitioning determines how data is split across a cluster; shuffling is what happens when that split has to change mid-job. Nearly every expensive thing that can happen in a Spark application — network-bound stages, disk spill, data skew, OOMs, small-file problems on write — traces back to how data was partitioned and when it had to be reshuffled. Unlike most tuning levers, which optimize one stage, getting partitioning right changes the shape of the *entire* job, because partition count and distribution propagate forward through every subsequent transformation until the next shuffle resets them.
