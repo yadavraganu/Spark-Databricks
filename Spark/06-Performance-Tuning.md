@@ -1,12 +1,6 @@
 # 06 — Apache Spark Performance Tuning: A Diagnostic, Data, and Code Guide
 
-> **Audience:** practitioners who need to diagnose and improve real batch and streaming jobs. This guide complements, rather than replaces, the deep dives on joins, shuffle, memory, Catalyst, and resource sizing. Version-sensitive defaults must be checked against the deployed Spark release.
-
 Memory management, joins, Catalyst internals, partitioning/shuffling, and cluster/resource tuning are each deep, self-contained topics. **Performance tuning is the practice of pulling all of them together** — knowing which lever to reach for first, how to tell which one is actually the bottleneck, and the practical, code-level habits that either help or quietly sabotage everything else. This guide assumes the mechanisms from the other material and focuses on what's distinct to tuning as a discipline: file format and storage choices, a repeatable diagnostic methodology, code-level anti-patterns, and the areas — compression trade-offs, columnar format internals, lakehouse table maintenance — that don't fit neatly into any of the other guides.
-
-
----
-
 
 ## 1. Tuning Methodology: Measure Before You Guess
 
@@ -20,10 +14,6 @@ The single most common mistake in performance tuning is applying a fix before co
 
 This loop matters because the same symptom ("job is slow") has structurally different causes — and a fix aimed at the wrong one (e.g., throwing more executors at a problem that's actually single-task skew) wastes effort and cluster spend without improving anything.
 
-
----
-
-
 ## 2. Reading Explain Plans as a Tuning Tool
 
 Covered in full mechanical depth in the Catalyst-internals material; here's the condensed, tuning-focused version of what to look for:
@@ -32,10 +22,6 @@ Covered in full mechanical depth in the Catalyst-internals material; here's the 
 - `.explain("formatted")` — numbered, readable breakdown of the physical plan tree, including `Exchange` (shuffle) nodes, which is often the fastest way to spot an unexpected or unnecessary shuffle.
 - `.explain("extended")` — shows parsed, analyzed, optimized logical, and physical plans together; useful when a query isn't behaving as expected and the question is *where* in the pipeline the surprising behavior was introduced.
 - **What to scan for specifically, in order of tuning relevance:** unexpected `Exchange` nodes (shuffles that shouldn't be there), `SortMergeJoin` where a `BroadcastHashJoin` was expected (check actual table sizes against `autoBroadcastJoinThreshold`), `CartesianProduct`/`BroadcastNestedLoopJoin` appearing unintentionally, and — for AQE-enabled queries — comparing the plan shown by `.explain()` before execution against the *actual* executed plan visible in the Spark UI's SQL tab afterward, since AQE can change the plan at runtime.
-
-
----
-
 
 ## 3. Bottleneck Triage: CPU, I/O, Memory, Skew, and Scheduling
 
@@ -60,9 +46,6 @@ A useful tuning diagnosis starts by separating *what the cluster is waiting for*
 
 **Avoid diagnosis by symptom alone:** executor OOM does not automatically mean “increase executor memory”; a long stage does not automatically mean “increase shuffle partitions”; and a high shuffle byte count is not necessarily waste if the algorithm genuinely requires data redistribution. Use [Memory Management](05-Memory-Management.md), [Partitioning and Shuffling](03-Partitioning-Shuffling.md), [Joins](04-Joins.md), and [Debugging and Monitoring](11-Debugging-Monitoring.md) for the corresponding deep dives.
 
----
-
-
 ## 4. File Formats and Columnar Storage — The Foundation Underneath Everything
 
 File format choice affects nearly every other tuning lever: how much data is read, whether it can be split for parallelism, and how much of Catalyst's pushdown machinery can actually engage.
@@ -83,10 +66,6 @@ File format choice affects nearly every other tuning lever: how much data is rea
 - **Dictionary encoding**: low-cardinality columns (status flags, categories) are frequently stored as a small dictionary plus integer references, shrinking both storage size and the amount of data moved through later stages of a plan.
 - **Bloom filters** (available in both Parquet and ORC, opt-in at write time) provide a stronger skip-ability guarantee than min/max stats alone for high-cardinality equality lookups — useful for point-lookup-style filters on columns where min/max ranges wouldn't narrow things down much.
 
-
----
-
-
 ## 5. Compression: Ratio, Speed, and Splittability Are Three Separate Axes
 
 Splittability (covered in depth in the partitioning material) is only one dimension of a compression choice — the other two, compression ratio and CPU cost, matter just as much for overall job performance:
@@ -101,10 +80,6 @@ Splittability (covered in depth in the partitioning material) is only one dimens
 
 **The practical takeaway:** inside a columnar container format (Parquet/ORC), splittability is already solved by the format itself, so the compression codec choice there is purely a ratio-vs-CPU decision — Snappy (fast, moderate ratio) and Zstd (strong, tunable ratio, still reasonably fast) are the two most common modern defaults, chosen based on whether storage/network cost or CPU cost is the more constrained resource for a given pipeline.
 
-
----
-
-
 ## 6. Predicate Pushdown and Column Pruning, By Source Type
 
 These were introduced conceptually in the Catalyst material; here's how pushdown capability actually varies by source, which directly affects how much performance benefit a given filter/projection delivers:
@@ -114,10 +89,6 @@ These were introduced conceptually in the Catalyst material; here's how pushdown
 - **CSV/JSON**: no meaningful pushdown benefit beyond basic file-level skipping, since there's no embedded per-block statistics to skip against — the entire file's rows must generally be read and parsed before filtering can apply.
 - **Confirming it actually happened**: the scan node in `.explain()` shows `PushedFilters` (what was pushed) versus the filters that remained as a separate `Filter` node above the scan (what wasn't) — this is the authoritative way to check pushdown occurred, rather than assuming it did because the source format supports it in principle.
 - **Worth distinguishing from row-group/stripe-level statistics pushdown**: if a table is physically laid out in partitioned directories on disk (`year=2026/month=10/...`, covered in depth in the partitioning material), a filter on that partition column skips entire **directories** before any file is even opened — a cheaper and coarser-grained skip than statistics-based pushdown within a file. The two compose together (directory-level partition pruning first, then row-group-level statistics pushdown within whatever files remain), and confirming *both* engaged — `PartitionFilters` for the directory-level skip, `PushedFilters` for the in-file skip — is worth doing separately, since a query can get one without the other.
-
-
----
-
 
 ## 7. Caching Strategy: A Practical Decision Framework
 
@@ -129,10 +100,6 @@ The full mechanics (storage levels, the Unified Memory Manager's eviction behavi
 4. **If yes to all three**, cache it — and choose the storage level based on whether the data fits fully in memory, needs a disk fallback, or benefits from a serialized representation. Remember that PySpark DataFrame and RDD defaults differ, and PySpark does not expose the JVM RDD `_SER` constants as named levels.
 5. **Always pair a deliberate `persist()`/`cache()` call with an explicit `unpersist()`** once that data is no longer needed — especially in long-running applications, where un-released cached blocks accumulate and degrade performance for everything that runs afterward in the same session.
 
-
----
-
-
 ## 8. Joins and Shuffles as Performance Levers (Summary)
 
 Covered in full in the dedicated joins and partitioning material — the performance-relevant summary:
@@ -143,17 +110,9 @@ Covered in full in the dedicated joins and partitioning material — the perform
 - Bucket tables that are joined repeatedly across many jobs, to eliminate the shuffle cost entirely rather than just reducing it per-run.
 - **Broadcast variables aren't only for joins**: a small lookup table or map needed inside a UDF or a `map`/`mapPartitions` closure can be wrapped in `sc.broadcast(...)` and shipped once per executor, rather than being captured in the task closure and re-serialized with every single task — a distinct, often-overlooked use of the same broadcast mechanism that powers broadcast joins, worth reaching for any time a sizable piece of reference data is being referenced from inside row/partition-level code.
 
-
----
-
-
 ## 9. Serialization
 
 - **Kryo** (`spark.serializer=org.apache.spark.serializer.KryoSerializer`) over the default Java serializer meaningfully shrinks both cached data (under `_SER` storage levels) and shuffle data, directly reducing I/O and memory pressure for shuffle-heavy or cache-heavy jobs — covered in full in the memory-management material, included here because it's one of the cheapest, lowest-risk performance changes available for a workload that hasn't already adopted it.
-
-
----
-
 
 ## 10. Code-Level Anti-Patterns That Undermine Everything Else
 
@@ -180,8 +139,6 @@ These are habits that quietly defeat tuning effort elsewhere in the stack, becau
 **Ignoring `null` handling in filters and joins**
 - As covered in the joins material, `NULL = NULL` is not true in standard SQL semantics — a filter or join that silently drops or fails to match null-containing rows isn't a performance bug per se, but a very common source of a "the data looks wrong, let me add more processing to fix it" spiral that compounds unnecessary computation on top of what was actually a logic issue.
 
----
-
 ## 11. Lakehouse Table Maintenance (Delta Lake / Iceberg / Hudi)
 
 For workloads built on a modern lakehouse table format rather than raw Parquet directories, several format-specific maintenance operations are themselves significant performance levers, distinct from anything Spark's own engine controls directly:
@@ -192,10 +149,6 @@ For workloads built on a modern lakehouse table format rather than raw Parquet d
 - **Table statistics / metadata refresh**: these formats maintain their own metadata layer (manifests, transaction logs) separate from the Hive Metastore-style statistics Catalyst's CBO uses — keeping this metadata compact and current (via the format's own maintenance commands) is a distinct, format-specific analog to the `ANALYZE TABLE` guidance covered in the joins and Catalyst material.
 - These operations are generally **not automatic** — they need to be scheduled/run periodically as part of a table's ongoing maintenance, and a lakehouse table that performs poorly over time despite "nothing changing" in the query logic is a common sign this maintenance has been neglected.
 
-
----
-
-
 ## 12. Checkpointing for Long Lineage Chains
 
 Distinct from caching (which keeps data for reuse within a job's lifetime) — **checkpointing** (`sparkContext.setCheckpointDir(...)`, `df.checkpoint()`) writes a DataFrame/RDD's data to reliable storage and **truncates its lineage**, which matters specifically for:
@@ -203,10 +156,6 @@ Distinct from caching (which keeps data for reuse within a job's lifetime) — *
 - **Very long iterative pipelines** (common in graph algorithms or iterative ML workloads) where lineage grows with every iteration — without truncation, a failure late in a long chain can trigger an extremely expensive recomputation cascading all the way back to the original source, and the lineage graph itself can become large enough to slow down the driver's own planning overhead.
 - Checkpointing trades the cost of an extra write (and later, re-read) for bounded recovery cost and a simpler lineage graph going forward — a reasonable trade specifically when lineage depth, not just data size, has become the concern.
 - **Reliable checkpointing** (`df.checkpoint()`, writing to the configured checkpoint directory on durable storage like HDFS/S3) survives executor loss, at the cost of a real write to durable storage. **Local checkpointing** (`df.localCheckpoint()`) writes to executor local storage instead — much faster, since it avoids the durable-storage round trip, but **not fault-tolerant**: losing the executor holding that local checkpoint loses the data, forcing a fall-back to full lineage recomputation anyway. Local checkpointing is the right choice when the goal is purely truncating a long lineage graph for planning/performance reasons within a single run, not when actual fault tolerance across executor loss is required.
-
-
----
-
 
 ## 13. Consolidated Configuration Cheat Sheet (Highest-Impact Items Across Areas)
 
@@ -223,7 +172,6 @@ Distinct from caching (which keeps data for reuse within a job's lifetime) — *
 | `spark.sql.cbo.enabled` | Catalyst | Enables statistics-driven join reordering — needs `ANALYZE TABLE` to be useful. |
 | `spark.speculation` | Cluster/Resource | Mitigates infrastructure stragglers — not a skew fix. |
 
----
 
 ## 14. Symptom-to-Area Map
 
@@ -241,31 +189,7 @@ A practical index pointing toward which specific lever/guide to dig into for a g
 | A UDF-heavy job is slow despite "enough" resources | Code-level — Catalyst can't optimize through the UDF; check for a built-in equivalent |
 | A long iterative job gets slower each iteration and eventually fails | Lineage growth — checkpointing |
 
-
----
-
-
-## 15. Practical Tuning Checklist
-
-- [ ] Identify the specific slow stage and its bottleneck type before applying any fix.
-- [ ] Confirm the actual physical plan via `.explain()` rather than assuming it from the code as written.
-- [ ] Use a columnar format (Parquet/ORC) for analytical storage, with pushdown confirmed via `PushedFilters`.
-- [ ] Choose compression based on ratio-vs-CPU needs for container formats; prioritize splittability separately for plain-text sources.
-- [ ] Apply the caching decision framework deliberately rather than caching reflexively or never.
-- [ ] Audit for UDF usage where a built-in function exists, and for debugging-habit actions (`count()`, `collect()`) left in production pipelines.
-- [ ] Check for expensive resource initialization (connections, models, compiled regexes) happening per-row instead of per-partition.
-- [ ] For partitioned tables, confirm both `PartitionFilters` (directory-level) and `PushedFilters` (in-file) engaged, not just one.
-- [ ] Use broadcast variables for sizable reference data referenced inside row/partition-level code, not just for joins.
-- [ ] Check for driver-side loops submitting many small jobs that could be expressed as one distributed operation.
-- [ ] For lakehouse tables, confirm compaction/Z-ordering/statistics maintenance is actually scheduled, not assumed automatic.
-- [ ] For long iterative pipelines, evaluate whether lineage depth itself (not just data size) warrants checkpointing.
-- [ ] Re-measure after every change — a fix that doesn't move the needle on the stage it targeted means the real bottleneck is still unidentified.
-
-
----
-
-
-## 16. A Concise Mental Model
+## 15. A Concise Mental Model
 
 - **Performance tuning is diagnosis first, fix second** — the same symptom can come from CPU, I/O, memory, or skew, and each needs a different response.
 - **File format and compression choices set a ceiling** on how much the rest of the stack can help — no amount of join or shuffle tuning compensates for a non-pushdown-capable format or an unsplittable source.
@@ -274,14 +198,3 @@ A practical index pointing toward which specific lever/guide to dig into for a g
 - **Lakehouse formats add a maintenance layer Spark itself doesn't manage automatically** — performance can degrade over time purely from neglected compaction/clustering, with no change in query logic at all.
 - **Every fix should be validated by re-measuring the specific stage it targeted** — tuning without re-measurement is just a sequence of guesses.
 
-
-## Final Production Tuning Checklist
-
-- Establish a repeatable input snapshot and baseline: runtime, input bytes/rows, output bytes/rows, cost, and SLA.
-- Inspect the **executed** plan, not only the initial logical plan; record AQE changes.
-- Check file count/size, partition count, shuffle read/write, skew, spill, GC, CPU utilization, and remote I/O.
-- Reduce data early with partition pruning, column pruning, and selective predicates.
-- Choose a join strategy based on actual size, semantics, and observed physical plan.
-- Use native SQL/DataFrame expressions before Python UDFs; vectorize unavoidable Python work.
-- Treat compaction, clustering, partitioning, statistics, and lakehouse-table maintenance as separate data-layout operations.
-- Change one major variable at a time and verify output correctness as well as speed and cost.
